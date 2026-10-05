@@ -26,6 +26,8 @@ export interface MovieItem {
   size: number;
   formattedSize: string;
   modifiedAt: string;
+  url?: string;
+  isCloud?: boolean;
 }
 
 export interface Reaction {

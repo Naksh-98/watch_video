@@ -13,6 +13,7 @@ const handle = app.getRequestHandler();
 
 const PORT = process.env.PORT || 3000;
 const MOVIES_DIR = path.join(__dirname, 'movies');
+const CLOUD_MOVIES_FILE = path.join(MOVIES_DIR, 'cloud_movies.json');
 
 // Ensure movies directory exists
 if (!fs.existsSync(MOVIES_DIR)) {
@@ -195,15 +196,22 @@ app.prepare().then(() => {
 
   // ================= Movie Library APIs =================
 
-  // 1. List all available movies in movies/ folder
+  // 1. List all available movies in movies/ folder (including cloud links)
   server.get('/api/movies', (req, res) => {
+    let cloudMovies = [];
+    if (fs.existsSync(CLOUD_MOVIES_FILE)) {
+      try {
+        cloudMovies = JSON.parse(fs.readFileSync(CLOUD_MOVIES_FILE, 'utf-8'));
+      } catch (e) {}
+    }
+
     fs.readdir(MOVIES_DIR, (err, files) => {
       if (err) {
         return res.status(500).json({ error: 'Failed to read movies directory' });
       }
 
-      const movies = files
-        .filter((file) => !file.startsWith('.'))
+      const localMovies = files
+        .filter((file) => !file.startsWith('.') && file !== 'cloud_movies.json')
         .map((file) => {
           const filePath = path.join(MOVIES_DIR, file);
           const stats = fs.statSync(filePath);
@@ -216,10 +224,11 @@ app.prepare().then(() => {
             size: stats.size,
             formattedSize,
             modifiedAt: stats.mtime,
+            isCloud: false,
           };
         });
 
-      res.json(movies);
+      res.json([...cloudMovies, ...localMovies]);
     });
   });
 
@@ -235,14 +244,51 @@ app.prepare().then(() => {
     });
   });
 
-  // 3. Delete video file (Keep PC storage clean)
+  // 2b. Add Cloud Movie URL
+  server.post('/api/movies/cloud', (req, res) => {
+    const { url, filename } = req.body;
+    if (!url || !filename) return res.status(400).json({ error: 'Missing url or filename' });
+
+    let cloudMovies = [];
+    if (fs.existsSync(CLOUD_MOVIES_FILE)) {
+      try { cloudMovies = JSON.parse(fs.readFileSync(CLOUD_MOVIES_FILE, 'utf-8')); } catch (e) {}
+    }
+
+    if (!cloudMovies.find(m => m.url === url)) {
+      cloudMovies.unshift({
+        filename: filename,
+        url: url,
+        size: 0,
+        formattedSize: 'Cloud Stream',
+        modifiedAt: new Date().toISOString(),
+        isCloud: true
+      });
+      fs.writeFileSync(CLOUD_MOVIES_FILE, JSON.stringify(cloudMovies, null, 2));
+    }
+    res.json({ success: true });
+  });
+
+  // 3. Delete video file (Keep PC storage clean) or Cloud Link
   server.delete('/api/movies/:filename', (req, res) => {
     const filename = req.params.filename;
-    // Prevent path traversal
+
+    // Check if it's a cloud movie first
+    let cloudMovies = [];
+    if (fs.existsSync(CLOUD_MOVIES_FILE)) {
+      try { cloudMovies = JSON.parse(fs.readFileSync(CLOUD_MOVIES_FILE, 'utf-8')); } catch (e) {}
+      const cloudIndex = cloudMovies.findIndex(m => m.filename === filename);
+      if (cloudIndex !== -1) {
+        cloudMovies.splice(cloudIndex, 1);
+        fs.writeFileSync(CLOUD_MOVIES_FILE, JSON.stringify(cloudMovies, null, 2));
+        return res.json({ success: true, message: 'Cloud link removed' });
+      }
+    }
+
+    // Otherwise, local file deletion
     const safeFilename = path.basename(filename);
     const filePath = path.join(MOVIES_DIR, safeFilename);
 
-    if (fs.existsSync(filePath)) {
+    if (fs.existsSync(filePath) && safeFilename !== 'cloud_movies.json') {
       fs.unlinkSync(filePath);
       return res.json({ success: true, message: 'Movie deleted successfully' });
     } else {

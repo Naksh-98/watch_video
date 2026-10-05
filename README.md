@@ -72,7 +72,42 @@ If her phone is connected to the same home Wi-Fi as your PC:
 
 ## 💡 How to Watch Without Any Buffering on Slow Internet
 
-1. **Step 1:** Upload the movie into SyncCinema from your PC.
-2. **Step 2:** She opens the room on her Android phone and taps **"Save"** next to the movie in the Movie Library to download it.
-3. **Step 3:** In the video player, she clicks **"Local File (Zero Buffering)"** and selects the downloaded video from her Android "Downloads" folder.
+1. **Step 1:** Upload the movie into SyncCinema from your PC in India.
+2. **Step 2:** She opens the room on her Android phone in the Philippines and taps **"Save" (Download)** next to the movie in the Movie Library.
+3. **Step 3:** In the video player, she clicks **"📁 Local File (Zero Buffering)"** and selects the downloaded video from her Android "Downloads" folder.
 4. **Step 4:** You hit Play — both of your players are perfectly locked in sync, and her video will never buffer because the file is playing locally!
+
+---
+
+## 🌏 India ↔ Philippines Connection Guide (Render vs. Cloudflare Tunnel)
+
+### ⚠️ Why Render Free Tier is NOT recommended for Video Files:
+1. **Ephemeral Filesystem**: Render's free tier wipes all uploaded files whenever the app restarts or sleeps (after 15 mins of inactivity). Any uploaded movie in `movies/` will be deleted.
+2. **512 MB RAM Limit**: Uploading multi-GB movie files directly to Render free tier will cause **Out-Of-Memory (OOM)** errors or timeouts.
+
+### 🚀 Recommended Setup: Your PC in India + Free Cloudflare Tunnel (100% Free & Unlimited Storage)
+
+#### Step-by-Step Instructions:
+1. **Start SyncCinema on your PC in India**:
+   ```bash
+   npm run dev
+   ```
+2. **Expose your PC securely over HTTPS using Cloudflare**:
+   In a second PowerShell window, run:
+   ```bash
+   npx cloudflared tunnel --url http://localhost:3000
+   ```
+   *Cloudflare will generate a public HTTPS URL (e.g. `https://your-custom-name.trycloudflare.com`).*
+
+3. **Share Link & Upload**:
+   - Send the `trycloudflare.com` link to your girlfriend on WhatsApp.
+   - Upload the movie on your PC (or place `.mp4` / `.mkv` files directly inside `movies/` directory).
+
+4. **She Downloads to Her Android Phone**:
+   - She opens the link in Chrome on her phone in the Philippines.
+   - In the **Movie Library**, she taps **"Save"** (Download). The video downloads straight from your PC hard drive over Cloudflare's global edge network.
+
+5. **Select Local File & Sync**:
+   - Once saved to her Android phone, she taps **"📁 Local File (Zero Buffering)"** in SyncCinema and selects the downloaded video file.
+   - Enter room `our-room` and press Play — **0% Buffering, 100% Locked-in Sync!**
+

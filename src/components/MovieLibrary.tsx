@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
-import { Upload, Trash2, Film, Download, Play, RefreshCw, HardDrive, CheckCircle2 } from 'lucide-react';
+import { Upload, Trash2, Film, Download, Play, RefreshCw, HardDrive, CheckCircle2, Link } from 'lucide-react';
 import { MovieItem } from '../lib/types';
 
 interface MovieLibraryProps {
@@ -15,6 +15,8 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
   const [uploadStatus, setUploadStatus] = useState<string | null>(null);
+  const [customUrl, setCustomUrl] = useState('');
+  const [showUrlInput, setShowUrlInput] = useState(false);
 
   const fetchMovies = async () => {
     try {
@@ -47,7 +49,6 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
     setUploadStatus(`Uploading ${file.name}...`);
 
     try {
-      // Use XMLHttpRequest to track upload progress accurately
       const xhr = new XMLHttpRequest();
       xhr.open('POST', '/api/movies/upload', true);
 
@@ -85,6 +86,25 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
     }
   };
 
+  const handleCustomUrlSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!customUrl.trim()) return;
+    
+    try {
+      const filename = prompt("Enter a title for this movie link:") || "Cloud Movie";
+      await fetch('/api/movies/cloud', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: customUrl.trim(), filename })
+      });
+      fetchMovies();
+      setCustomUrl('');
+      setShowUrlInput(false);
+    } catch (err) {
+      console.error('Failed to add cloud link:', err);
+    }
+  };
+
   const handleDelete = async (filename: string) => {
     if (!confirm(`Are you sure you want to delete "${filename}"? This will free space on your PC.`)) {
       return;
@@ -106,7 +126,7 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
 
   return (
     <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-4 shadow-xl">
-      <div className="flex items-center justify-between mb-4 pb-3 border-b border-neutral-800">
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-4 pb-3 border-b border-neutral-800">
         <div className="flex items-center gap-2">
           <Film className="w-5 h-5 text-rose-500" />
           <h2 className="font-bold text-white text-base">Movie Library</h2>
@@ -114,6 +134,15 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
         </div>
 
         <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowUrlInput(!showUrlInput)}
+            className="flex items-center gap-1 px-2.5 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded-lg text-xs font-semibold transition-all border border-neutral-700"
+            title="Stream direct video URL (e.g. Cloudflare R2 / S3 / Direct link)"
+          >
+            <Link className="w-3.5 h-3.5 text-blue-400" />
+            <span>Stream Link</span>
+          </button>
+
           <button
             onClick={fetchMovies}
             className="p-1.5 hover:bg-neutral-800 rounded-lg text-neutral-400 hover:text-white transition-colors"
@@ -136,6 +165,27 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
           </label>
         </div>
       </div>
+
+      {/* Direct Video URL Input Box */}
+      {showUrlInput && (
+        <form onSubmit={handleCustomUrlSubmit} className="mb-4 flex gap-2">
+          <input
+            type="url"
+            required
+            placeholder="Paste direct .mp4 or stream URL (e.g. https://domain.com/video.mp4)"
+            value={customUrl}
+            onChange={(e) => setCustomUrl(e.target.value)}
+            className="flex-1 px-3 py-2 bg-neutral-800 border border-neutral-700 rounded-lg text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-rose-500"
+          />
+          <button
+            type="submit"
+            className="px-3 py-2 bg-blue-600 hover:bg-blue-500 text-white rounded-lg text-xs font-semibold transition-colors flex items-center gap-1"
+          >
+            <Link className="w-3.5 h-3.5" />
+            <span>Add Link</span>
+          </button>
+        </form>
+      )}
 
       {/* Upload Progress Bar */}
       {uploading && (
@@ -165,7 +215,8 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
       ) : (
         <div className="grid gap-2 max-h-72 overflow-y-auto pr-1">
           {movies.map((movie) => {
-            const isSelected = currentMovie === movie.filename;
+            const movieKey = movie.url || movie.filename;
+            const isSelected = currentMovie === movieKey;
             return (
               <div
                 key={movie.filename}
@@ -190,7 +241,7 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
                 <div className="flex items-center gap-1.5 self-end sm:self-center shrink-0">
                   {/* Select to Watch */}
                   <button
-                    onClick={() => onSelectMovie(movie.filename)}
+                    onClick={() => onSelectMovie(movieKey)}
                     className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium transition-all ${
                       isSelected
                         ? 'bg-rose-600 text-white'
@@ -203,15 +254,29 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
                   </button>
 
                   {/* Pre-download button for Slow Internet / Zero Buffering */}
-                  <a
-                    href={`/api/movies/download/${encodeURIComponent(movie.filename)}`}
-                    download={movie.filename}
-                    className="flex items-center gap-1 px-2 py-1 bg-neutral-700/60 hover:bg-neutral-600 text-neutral-300 rounded-md text-xs transition-colors"
-                    title="Download to phone/device for 100% Zero-Buffering offline sync"
-                  >
-                    <Download className="w-3.5 h-3.5 text-emerald-400" />
-                    <span className="hidden sm:inline">Save</span>
-                  </a>
+                  {movie.isCloud ? (
+                    <a
+                      href={movie.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      download
+                      className="flex items-center gap-1 px-2 py-1 bg-neutral-700/60 hover:bg-neutral-600 text-neutral-300 rounded-md text-xs transition-colors"
+                      title="Download direct cloud link"
+                    >
+                      <Download className="w-3.5 h-3.5 text-emerald-400" />
+                      <span className="hidden sm:inline">Save</span>
+                    </a>
+                  ) : (
+                    <a
+                      href={`/api/movies/download/${encodeURIComponent(movie.filename)}`}
+                      download={movie.filename}
+                      className="flex items-center gap-1 px-2 py-1 bg-neutral-700/60 hover:bg-neutral-600 text-neutral-300 rounded-md text-xs transition-colors"
+                      title="Download to phone/device for 100% Zero-Buffering offline sync"
+                    >
+                      <Download className="w-3.5 h-3.5 text-emerald-400" />
+                      <span className="hidden sm:inline">Save</span>
+                    </a>
+                  )}
 
                   {/* Delete Button to Free PC Storage */}
                   <button

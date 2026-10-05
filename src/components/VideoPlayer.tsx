@@ -39,8 +39,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   // Prevent sync echo feedback loops
   const isIncomingUpdateRef = useRef(false);
 
-  // Determine active video source
-  const videoSrc = localFileUrl || (movieFilename ? `/api/movies/stream/${encodeURIComponent(movieFilename)}` : null);
+  // Determine active video source (Local file -> Direct URL -> Server HTTP 206 Stream)
+  const videoSrc = localFileUrl || (
+    movieFilename ? (
+      movieFilename.startsWith('http://') || movieFilename.startsWith('https://')
+        ? movieFilename
+        : `/api/movies/stream/${encodeURIComponent(movieFilename)}`
+    ) : null
+  );
 
   // Handle local file selection (Ultimate Zero Buffering mode)
   const handleLocalFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
