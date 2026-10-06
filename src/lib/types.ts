@@ -35,3 +35,10 @@ export interface Reaction {
   emoji: string;
   senderName: string;
 }
+
+export interface ChatMessage {
+  id: string;
+  text: string;
+  senderName: string;
+  timestamp: number;
+}

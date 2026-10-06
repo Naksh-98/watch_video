@@ -177,6 +177,18 @@ app.prepare().then(() => {
       }
     });
 
+    // Chat messages
+    socket.on('send_chat', ({ text }) => {
+      if (currentRoom) {
+        io.to(currentRoom).emit('chat_received', {
+          id: Math.random().toString(),
+          text,
+          senderName: userName,
+          timestamp: Date.now(),
+        });
+      }
+    });
+
     socket.on('disconnect', () => {
       if (currentRoom && rooms.has(currentRoom)) {
         const roomUsers = rooms.get(currentRoom);

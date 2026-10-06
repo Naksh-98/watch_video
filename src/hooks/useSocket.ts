@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { RoomUser, SyncAction, PartnerState } from '../lib/types';
+import { RoomUser, SyncAction, PartnerState, ChatMessage } from '../lib/types';
 
 interface UseSocketProps {
   roomCode: string;
@@ -10,6 +10,7 @@ interface UseSocketProps {
   onBufferChange?: (data: { senderName: string; isBuffering: boolean }) => void;
   onMovieSelected?: (data: { filename: string; senderName: string }) => void;
   onReaction?: (data: { emoji: string; senderName: string }) => void;
+  onChatMessage?: (message: ChatMessage) => void;
   onUserJoined?: (user: { id: string; name: string }) => void;
   onUserLeft?: (user: { id: string; name: string }) => void;
 }
@@ -22,6 +23,7 @@ export function useSocket({
   onBufferChange,
   onMovieSelected,
   onReaction,
+  onChatMessage,
   onUserJoined,
   onUserLeft,
 }: UseSocketProps) {
@@ -79,6 +81,10 @@ export function useSocket({
       if (onReaction) onReaction(data);
     });
 
+    socket.on('chat_received', (message: ChatMessage) => {
+      if (onChatMessage) onChatMessage(message);
+    });
+
     return () => {
       socket.disconnect();
     };
@@ -114,6 +120,12 @@ export function useSocket({
     }
   };
 
+  const sendChatMessage = (text: string) => {
+    if (socketRef.current?.connected) {
+      socketRef.current.emit('send_chat', { text });
+    }
+  };
+
   return {
     socket: socketRef.current,
     isConnected,
@@ -123,5 +135,6 @@ export function useSocket({
     sendBufferChange,
     selectMovie,
     sendReaction,
+    sendChatMessage,
   };
 }

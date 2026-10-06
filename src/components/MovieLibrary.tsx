@@ -151,18 +151,6 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
             <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
 
-          {/* Upload Button */}
-          <label className="flex items-center gap-1.5 px-3 py-1.5 bg-rose-600 hover:bg-rose-500 active:scale-95 text-white rounded-lg text-xs font-semibold cursor-pointer transition-all shadow-md shadow-rose-950">
-            <Upload className="w-3.5 h-3.5" />
-            <span>Upload Movie</span>
-            <input
-              type="file"
-              accept="video/*,.mkv,.mp4,.webm,.mov"
-              onChange={handleFileUpload}
-              disabled={uploading}
-              className="hidden"
-            />
-          </label>
         </div>
       </div>
 
@@ -187,7 +175,8 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
         </form>
       )}
 
-      {/* Upload Progress Bar */}
+      {/* Upload Progress Bar (Commented out as Upload is disabled) */}
+      {/* 
       {uploading && (
         <div className="mb-4 bg-neutral-800/80 p-3 rounded-xl border border-rose-500/30">
           <div className="flex items-center justify-between text-xs mb-1.5">
@@ -202,14 +191,15 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
           </div>
         </div>
       )}
+      */}
 
       {/* Movie List */}
       {movies.length === 0 ? (
         <div className="text-center py-8 text-neutral-500 text-xs">
           <HardDrive className="w-8 h-8 mx-auto mb-2 opacity-40" />
-          <p>No movies uploaded yet.</p>
+          <p>No movies added yet.</p>
           <p className="mt-1 text-neutral-600">
-            Upload an .mp4 or .mkv movie above to start watching together!
+            Click "Add URL" to stream a video directly, or select a local file from the video player above!
           </p>
         </div>
       ) : (

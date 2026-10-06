@@ -8,6 +8,7 @@ interface PartnerHUDProps {
   myTime: number;
   myIsPlaying: boolean;
   partner: PartnerState | null;
+  partnerName?: string | null;
   onJumpToPartner: (targetTime: number) => void;
   onRequestPartnerJump: () => void;
 }
@@ -31,6 +32,7 @@ export const PartnerHUD: React.FC<PartnerHUDProps> = ({
   myTime,
   myIsPlaying,
   partner,
+  partnerName,
   onJumpToPartner,
   onRequestPartnerJump,
 }) => {
@@ -39,7 +41,11 @@ export const PartnerHUD: React.FC<PartnerHUDProps> = ({
       <div className="bg-neutral-900/60 border border-neutral-800 rounded-xl p-3 flex items-center justify-between text-xs text-neutral-400">
         <div className="flex items-center gap-2">
           <span className="w-2 h-2 rounded-full bg-neutral-600 animate-pulse" />
-          <span>Waiting for your partner to join this room...</span>
+          <span>
+            {partnerName
+              ? `Waiting for ${partnerName} to open a video...`
+              : 'Waiting for your partner to join this room...'}
+          </span>
         </div>
         <span className="text-neutral-500">Your Time: {formatTime(myTime)}</span>
       </div>
@@ -64,9 +70,8 @@ export const PartnerHUD: React.FC<PartnerHUDProps> = ({
                 {formatTime(myTime)}
               </span>
               <span
-                className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
-                  myIsPlaying ? 'bg-emerald-500/20 text-emerald-400' : 'bg-neutral-800 text-neutral-400'
-                }`}
+                className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${myIsPlaying ? 'bg-emerald-500/20 text-emerald-400' : 'bg-neutral-800 text-neutral-400'
+                  }`}
               >
                 {myIsPlaying ? 'PLAYING' : 'PAUSED'}
               </span>
@@ -90,11 +95,10 @@ export const PartnerHUD: React.FC<PartnerHUDProps> = ({
                 {formatTime(partner.currentTime)}
               </span>
               <span
-                className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
-                  partner.isPlaying
+                className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${partner.isPlaying
                     ? 'bg-rose-500/20 text-rose-400'
                     : 'bg-neutral-800 text-neutral-400'
-                }`}
+                  }`}
               >
                 {partner.isPlaying ? 'PLAYING' : 'PAUSED'}
               </span>
@@ -122,11 +126,10 @@ export const PartnerHUD: React.FC<PartnerHUDProps> = ({
           {/* THE CORE REQUESTED BUTTON: Jump to Partner */}
           <button
             onClick={() => onJumpToPartner(partner.currentTime)}
-            className={`flex-1 sm:flex-initial flex items-center justify-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all shadow-md active:scale-95 ${
-              isFarApart
+            className={`flex-1 sm:flex-initial flex items-center justify-center gap-2 px-3.5 py-2 rounded-lg text-xs font-semibold transition-all shadow-md active:scale-95 ${isFarApart
                 ? 'bg-rose-600 hover:bg-rose-500 text-white animate-pulse shadow-rose-900/40'
                 : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-200'
-            }`}
+              }`}
             title={`Jump your video immediately to ${formatTime(partner.currentTime)}`}
           >
             <FastForward className="w-4 h-4 text-white" />
@@ -149,7 +152,7 @@ export const PartnerHUD: React.FC<PartnerHUDProps> = ({
         <div className="mt-3 bg-amber-500/10 border border-amber-500/30 rounded-lg p-2 flex items-center gap-2 text-xs text-amber-300">
           <Loader2 className="w-4 h-4 animate-spin text-amber-400" />
           <span>
-            {partner.name || 'Your partner'} is currently buffering due to slower internet. The player will automatically pause to let them catch up!
+            {partner.name || 'Your partner'} is currently buffering due to slower internet. They may fall behind. You can wait for them or use the Sync button later!
           </span>
         </div>
       )}

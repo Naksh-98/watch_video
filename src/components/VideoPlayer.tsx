@@ -1,8 +1,9 @@
 'use client';
 
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, FolderOpen, Subtitles, AlertTriangle, Rewind, FastForward, Settings, RefreshCw } from 'lucide-react';
-import { SyncAction, Reaction } from '../lib/types';
+import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, FolderOpen, Subtitles, AlertTriangle, Rewind, FastForward, Settings, RefreshCw, MessageSquare, X } from 'lucide-react';
+import { SyncAction, Reaction, ChatMessage } from '../lib/types';
+import { ChatBox } from './ChatBox';
 
 interface VideoPlayerProps {
   movieFilename: string | null;
@@ -12,6 +13,10 @@ interface VideoPlayerProps {
   incomingAction: SyncAction | null;
   externalJumpTime: number | null;
   reactions: Reaction[];
+  chatMessages: ChatMessage[];
+  onSendMessage: (text: string) => void;
+  onOpenChatTab: () => void;
+  userName: string;
 }
 
 export const VideoPlayer: React.FC<VideoPlayerProps> = ({
@@ -22,6 +27,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   incomingAction,
   externalJumpTime,
   reactions,
+  chatMessages,
+  onSendMessage,
+  onOpenChatTab,
+  userName,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -35,16 +44,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [localFileUrl, setLocalFileUrl] = useState<string | null>(null);
   const [localFileName, setLocalFileName] = useState<string | null>(null);
   const [subtitleUrl, setSubtitleUrl] = useState<string | null>(null);
-  
+
   const [showControls, setShowControls] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showQualityMsg, setShowQualityMsg] = useState(false);
+  const [showChatOverlay, setShowChatOverlay] = useState(false);
+  const [latestPopupMsg, setLatestPopupMsg] = useState<ChatMessage | null>(null);
   const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const popupTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // Prevent sync echo feedback loops
   const isIncomingUpdateRef = useRef(false);
 
-  // Determine active video source
+  // Determine active video source (Local file -> Direct URL -> Server HTTP 206 Stream)
   const videoSrc = localFileUrl || (
     movieFilename ? (
       movieFilename.startsWith('http://') || movieFilename.startsWith('https://')
@@ -73,9 +85,26 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     return () => {
       document.removeEventListener('fullscreenchange', handleFullscreenChange);
       if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
+      if (popupTimeoutRef.current) clearTimeout(popupTimeoutRef.current);
     };
   }, []);
 
+  // Show subtitle popup when a new message arrives
+  useEffect(() => {
+    if (chatMessages.length === 0) return;
+    const latest = chatMessages[chatMessages.length - 1];
+    
+    // Don't show popup if chat is already open, or if the current user sent the message
+    if (showChatOverlay || latest.senderName === userName) return;
+
+    setLatestPopupMsg(latest);
+    if (popupTimeoutRef.current) clearTimeout(popupTimeoutRef.current);
+    popupTimeoutRef.current = setTimeout(() => {
+      setLatestPopupMsg(null);
+    }, 4000);
+  }, [chatMessages, showChatOverlay, userName]);
+
+  // Handle local file selection (Ultimate Zero Buffering mode)
   const handleLocalFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
@@ -85,6 +114,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   };
 
+  // Handle Subtitle file upload (.vtt or .srt)
   const handleSubtitleSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -93,6 +123,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       const url = URL.createObjectURL(file);
       setSubtitleUrl(url);
     } else {
+      // Basic SRT to VTT converter in-browser
       const reader = new FileReader();
       reader.onload = () => {
         let text = reader.result as string;
@@ -104,13 +135,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   };
 
+  // Play / Pause Toggle
   const togglePlay = useCallback((e?: React.MouseEvent) => {
     e?.stopPropagation();
     const video = videoRef.current;
     if (!video) return;
 
     if (video.paused) {
-      video.play().catch(() => {});
+      video.play().catch(() => { });
       onSendSyncAction('play', video.currentTime);
     } else {
       video.pause();
@@ -139,6 +171,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   };
 
+  // Handle Progress Bar Seek
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
     const video = videoRef.current;
     if (!video) return;
@@ -149,6 +182,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     handleUserActivity();
   };
 
+  // Handle Incoming Remote Sync Action from Partner
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !incomingAction) return;
@@ -162,7 +196,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       if (Math.abs(video.currentTime - incomingAction.time) > 1) {
         video.currentTime = incomingAction.time;
       }
-      video.play().catch(() => {});
+      video.play().catch(() => { });
       setIsPlaying(true);
     } else if (incomingAction.action === 'pause') {
       if (Math.abs(video.currentTime - incomingAction.time) > 1) {
@@ -177,6 +211,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }, 250);
   }, [incomingAction]);
 
+  // Handle "Jump to Partner" External Button Click
   useEffect(() => {
     const video = videoRef.current;
     if (!video || externalJumpTime === null) return;
@@ -190,6 +225,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }, 250);
   }, [externalJumpTime]);
 
+  // Heartbeat loop every 1 second
   useEffect(() => {
     const interval = setInterval(() => {
       const video = videoRef.current;
@@ -200,6 +236,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     return () => clearInterval(interval);
   }, [onSendHeartbeat, isBuffering]);
 
+  // Video Native Event Handlers
   const onTimeUpdate = () => {
     if (videoRef.current) {
       setCurrentTime(videoRef.current.currentTime);
@@ -214,17 +251,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
   const onPlayHandler = () => {
     setIsPlaying(true);
-    if (!isIncomingUpdateRef.current && videoRef.current) {
-      onSendSyncAction('play', videoRef.current.currentTime);
-    }
   };
 
   const onPauseHandler = () => {
     setIsPlaying(false);
-    if (!isIncomingUpdateRef.current && videoRef.current) {
-      onSendSyncAction('pause', videoRef.current.currentTime);
-    }
-    setShowControls(true); // Always show controls when paused
+    setShowControls(true);
   };
 
   const onWaitingHandler = () => {
@@ -241,18 +272,10 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     e?.stopPropagation();
     if (!containerRef.current) return;
     if (!document.fullscreenElement) {
-      containerRef.current.requestFullscreen().catch(() => {});
+      containerRef.current.requestFullscreen().catch(() => { });
     } else {
-      document.exitFullscreen().catch(() => {});
+      document.exitFullscreen().catch(() => { });
     }
-  };
-
-  const toggleMute = (e?: React.MouseEvent) => {
-    e?.stopPropagation();
-    const video = videoRef.current;
-    if (!video) return;
-    video.muted = !video.muted;
-    setIsMuted(video.muted);
   };
 
   const showQualityNotice = (e?: React.MouseEvent) => {
@@ -261,11 +284,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     setTimeout(() => setShowQualityMsg(false), 3000);
   };
 
+  const toggleMute = () => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.muted = !video.muted;
+    setIsMuted(video.muted);
+  };
+
   return (
-    <div className="w-full flex flex-col items-center">
+    <div className="flex flex-col gap-2">
+      {/* Video Container */}
       <div
         ref={containerRef}
-        className="relative w-full bg-black rounded-2xl overflow-hidden aspect-video border border-neutral-800 shadow-2xl flex items-center justify-center group select-none"
+        className="relative bg-black rounded-2xl overflow-hidden aspect-video border border-neutral-800 shadow-2xl flex items-center justify-center group select-none"
         onMouseMove={handleUserActivity}
         onTouchStart={handleUserActivity}
         onClick={handleUserActivity}
@@ -282,7 +313,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             onWaiting={onWaitingHandler}
             onPlaying={onPlayingHandler}
             playsInline
-            className="w-full h-full object-contain"
+            className="w-full h-full object-contain cursor-pointer"
             onClick={togglePlay}
           >
             {subtitleUrl && (
@@ -304,7 +335,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           {reactions.map((reaction) => (
             <div
               key={reaction.id}
-              className="absolute bottom-20 right-10 animate-bounce text-4xl sm:text-5xl"
+              className="absolute bottom-10 right-10 animate-bounce text-4xl sm:text-5xl"
               style={{
                 animationDuration: '1.8s',
                 right: `${20 + (Math.random() * 40)}%`,
@@ -314,6 +345,28 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             </div>
           ))}
         </div>
+
+        {/* Subtitle-like Chat Popup */}
+        {latestPopupMsg && !showChatOverlay && (
+          <div className="absolute top-6 left-6 flex justify-start pointer-events-none z-30">
+            <div className="bg-black/80 backdrop-blur-md px-4 py-2 rounded-xl border border-white/10 shadow-2xl flex flex-col items-start max-w-lg text-left animate-in fade-in slide-in-from-top-4 duration-300">
+              <span className="text-[10px] text-rose-400 font-bold uppercase tracking-wider mb-0.5">{latestPopupMsg.senderName} says:</span>
+              <span className="text-white text-sm sm:text-base font-medium">{latestPopupMsg.text}</span>
+            </div>
+          </div>
+        )}
+
+        {/* Chat Overlay */}
+        {showChatOverlay && (
+          <div className="absolute inset-y-0 right-0 w-full max-w-sm z-40 animate-in slide-in-from-right-8 duration-300">
+            <ChatBox
+              messages={chatMessages}
+              onSendMessage={onSendMessage}
+              isOverlay={true}
+              onClose={() => setShowChatOverlay(false)}
+            />
+          </div>
+        )}
 
         {/* Buffering Spinner Overlay */}
         {isBuffering && (
@@ -327,10 +380,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
         {/* Overlay Controls */}
         {videoSrc && (
-          <div 
-            className={`absolute inset-0 flex flex-col justify-between z-20 transition-opacity duration-300 pointer-events-none ${
-              showControls || !isPlaying ? 'opacity-100' : 'opacity-0'
-            }`}
+          <div
+            className={`absolute inset-0 flex flex-col justify-between z-20 transition-opacity duration-300 pointer-events-none ${showControls || !isPlaying ? 'opacity-100' : 'opacity-0'
+              }`}
           >
             {/* Top Bar (Sync, Quality, Exit Fullscreen) */}
             <div className="flex justify-between items-start p-4 bg-gradient-to-b from-black/80 via-black/40 to-transparent pointer-events-auto">
@@ -342,7 +394,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                   <RefreshCw className="w-4 h-4" />
                   <span className="hidden sm:inline">Force Sync Partner</span>
                 </button>
-                
+
                 <div className="relative">
                   <button
                     onClick={showQualityNotice}
@@ -370,120 +422,150 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               )}
             </div>
 
+            {/* Right Side Chat Toggle (Absolute to not disrupt center controls) */}
+            <div className="absolute top-1/2 right-4 -translate-y-1/2 pointer-events-auto">
+              {!showChatOverlay && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); setShowChatOverlay(true); }}
+                  className="relative p-3 sm:p-4 bg-black/40 hover:bg-black/60 rounded-full text-white backdrop-blur-sm transition-transform active:scale-95 group"
+                  title="Open Chat Overlay"
+                >
+                  <MessageSquare className="w-5 h-5 sm:w-6 sm:h-6" />
+                  {latestPopupMsg && (
+                    <span className="absolute top-0 right-0 w-3 h-3 bg-rose-500 rounded-full border-2 border-black animate-pulse" />
+                  )}
+                </button>
+              )}
+            </div>
+
             {/* Center Play/Pause & Skip */}
-            <div className="flex justify-center items-center gap-4 sm:gap-8 pointer-events-auto">
-              <button 
-                onClick={(e) => skip(-10, e)} 
+            <div className="flex justify-center items-center gap-4 sm:gap-8 pointer-events-auto flex-1">
+              <button
+                onClick={(e) => skip(-10, e)}
                 className="p-3 sm:p-4 bg-black/40 hover:bg-black/60 rounded-full text-white backdrop-blur-sm transition-transform active:scale-95"
               >
                 <Rewind className="w-6 h-6 sm:w-8 sm:h-8" />
               </button>
-              
-              <button 
-                onClick={togglePlay} 
+
+              <button
+                onClick={togglePlay}
                 className="p-4 sm:p-6 bg-rose-600/90 hover:bg-rose-500 rounded-full text-white backdrop-blur-sm transition-transform active:scale-95 shadow-lg shadow-rose-900/50"
               >
                 {isPlaying ? <Pause className="w-8 h-8 sm:w-10 sm:h-10" /> : <Play className="w-8 h-8 sm:w-10 sm:h-10 ml-1" />}
               </button>
 
-              <button 
-                onClick={(e) => skip(10, e)} 
+              <button
+                onClick={(e) => skip(10, e)}
                 className="p-3 sm:p-4 bg-black/40 hover:bg-black/60 rounded-full text-white backdrop-blur-sm transition-transform active:scale-95"
               >
                 <FastForward className="w-6 h-6 sm:w-8 sm:h-8" />
               </button>
             </div>
 
-            {/* Bottom Bar (Progress, Volume, etc) */}
-            <div className="p-4 bg-gradient-to-t from-black/90 via-black/60 to-transparent pointer-events-auto flex flex-col gap-3">
-              
-              {/* Progress Bar Slider */}
-              <div className="flex items-center gap-2 group/slider cursor-pointer" onClick={(e) => e.stopPropagation()}>
-                <input
-                  type="range"
-                  min="0"
-                  max={duration || 100}
-                  step="0.1"
-                  value={currentTime}
-                  onChange={handleSeek}
-                  className="w-full h-1.5 sm:h-1 bg-neutral-600 rounded-lg appearance-none cursor-pointer accent-rose-500 group-hover/slider:h-2 transition-all"
-                />
-              </div>
-
-              <div className="flex items-center justify-between gap-3 text-xs" onClick={(e) => e.stopPropagation()}>
-                {/* Left Controls: Volume */}
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={toggleMute}
-                    className="text-white hover:text-rose-400 transition-colors p-1"
-                  >
-                    {isMuted || volume === 0 ? <VolumeX className="w-5 h-5 text-red-400" /> : <Volume2 className="w-5 h-5" />}
-                  </button>
-                  <input
-                    type="range"
-                    min="0"
-                    max="1"
-                    step="0.05"
-                    value={volume}
-                    onChange={(e) => {
-                      const val = parseFloat(e.target.value);
-                      setVolume(val);
-                      if (videoRef.current) {
-                        videoRef.current.volume = val;
-                        videoRef.current.muted = val === 0;
-                        setIsMuted(val === 0);
-                      }
-                    }}
-                    className="w-16 sm:w-20 h-1.5 bg-neutral-600 rounded-lg appearance-none cursor-pointer accent-white hidden sm:block"
-                  />
-                  <span className="text-white font-mono text-[11px] sm:text-xs font-medium ml-1">
-                    {formatTime(currentTime)} / {formatTime(duration)}
-                  </span>
-                </div>
-
-                {/* Right Controls: Local File, Subtitles, Fullscreen */}
-                <div className="flex items-center gap-2 sm:gap-3">
-                  <label
-                    className="flex items-center gap-1.5 px-2 py-1.5 bg-white/10 hover:bg-white/20 active:scale-95 text-white rounded-lg cursor-pointer transition-colors backdrop-blur-sm"
-                    title="Pick local video file"
-                  >
-                    <FolderOpen className="w-4 h-4 text-emerald-400" />
-                    <span className="hidden md:inline font-medium">
-                      {localFileName ? 'Local Loaded' : 'Local File'}
-                    </span>
-                    <input
-                      type="file"
-                      accept="video/*,.mkv,.mp4,.webm"
-                      onChange={handleLocalFileSelect}
-                      className="hidden"
-                    />
-                  </label>
-
-                  <label
-                    className="flex items-center gap-1 px-2 py-1.5 bg-white/10 hover:bg-white/20 active:scale-95 text-white rounded-lg cursor-pointer transition-colors backdrop-blur-sm"
-                    title="Load Subtitle (.srt or .vtt)"
-                  >
-                    <Subtitles className="w-4 h-4 text-blue-400" />
-                    <input
-                      type="file"
-                      accept=".srt,.vtt"
-                      onChange={handleSubtitleSelect}
-                      className="hidden"
-                    />
-                  </label>
-
-                  <button
-                    onClick={toggleFullscreen}
-                    className="p-1.5 text-white hover:text-rose-400 transition-colors ml-1"
-                    title="Toggle Fullscreen"
-                  >
-                    {isFullscreen ? <Minimize className="w-5 h-5" /> : <Maximize className="w-5 h-5" />}
-                  </button>
-                </div>
-              </div>
-            </div>
+            {/* Empty placeholder for Bottom area, since we moved the control bar below the video */}
+            <div className="p-4 bg-gradient-to-t from-black/60 to-transparent pointer-events-none h-16 sm:h-24" />
           </div>
         )}
+      </div>
+
+      {/* Primary Video Controls & Secondary Toolbars */}
+      <div className="bg-neutral-900 border border-neutral-800 rounded-xl p-3 flex flex-col gap-2.5 shadow-lg">
+        {/* Progress Bar Slider */}
+        <div className="flex items-center gap-2">
+          <input
+            type="range"
+            min="0"
+            max={duration || 100}
+            step="0.1"
+            value={currentTime}
+            onChange={handleSeek}
+            disabled={!videoSrc}
+            className="w-full h-1.5 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-rose-500 hover:h-2 transition-all"
+          />
+        </div>
+
+        <div className="flex items-center justify-between gap-3 text-xs">
+          {/* Left Controls: Play/Pause, Mute, Volume */}
+          <div className="flex items-center gap-3">
+            <button
+              onClick={togglePlay}
+              disabled={!videoSrc}
+              className="p-2 bg-rose-600 hover:bg-rose-500 active:scale-95 text-white rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed shadow-md shadow-rose-950"
+            >
+              {isPlaying ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 ml-0.5" />}
+            </button>
+
+            <button
+              onClick={toggleMute}
+              className="text-neutral-400 hover:text-white transition-colors"
+            >
+              {isMuted ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4" />}
+            </button>
+
+            <input
+              type="range"
+              min="0"
+              max="1"
+              step="0.05"
+              value={volume}
+              onChange={(e) => {
+                const val = parseFloat(e.target.value);
+                setVolume(val);
+                if (videoRef.current) {
+                  videoRef.current.volume = val;
+                }
+              }}
+              className="w-16 h-1 bg-neutral-700 rounded-lg appearance-none cursor-pointer accent-neutral-300 hidden sm:block"
+            />
+
+            <span className="text-neutral-400 font-mono text-[11px]">
+              {formatTime(currentTime)} / {formatTime(duration)}
+            </span>
+          </div>
+
+          {/* Right Controls: Local File, Subtitles, Fullscreen */}
+          <div className="flex items-center gap-2">
+            {/* Zero-Buffering Local File Picker */}
+            <label
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-neutral-800 hover:bg-neutral-700 active:scale-95 text-neutral-300 rounded-lg cursor-pointer transition-all border border-neutral-700"
+              title="Pick local downloaded video file for 100% Zero Buffering"
+            >
+              <FolderOpen className="w-3.5 h-3.5 text-emerald-400" />
+              <span className="hidden md:inline">
+                {localFileName ? 'Local Loaded' : 'Local File (Zero Buffering)'}
+              </span>
+              <input
+                type="file"
+                accept="video/*,.mkv,.mp4,.webm"
+                onChange={handleLocalFileSelect}
+                className="hidden"
+              />
+            </label>
+
+            {/* Subtitle Selector */}
+            <label
+              className="flex items-center gap-1 px-2 py-1.5 bg-neutral-800 hover:bg-neutral-700 active:scale-95 text-neutral-300 rounded-lg cursor-pointer transition-all border border-neutral-700"
+              title="Load Subtitle file (.srt or .vtt)"
+            >
+              <Subtitles className="w-3.5 h-3.5 text-blue-400" />
+              <input
+                type="file"
+                accept=".srt,.vtt"
+                onChange={handleSubtitleSelect}
+                className="hidden"
+              />
+            </label>
+
+            {/* Fullscreen Button */}
+            <button
+              onClick={toggleFullscreen}
+              className="p-1.5 hover:bg-neutral-800 text-neutral-400 hover:text-white rounded-lg transition-colors"
+              title="Toggle Fullscreen"
+            >
+              <Maximize className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );

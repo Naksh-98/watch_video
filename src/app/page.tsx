@@ -8,8 +8,9 @@ import { VoiceCall } from '../components/VoiceCall';
 import { PartnerHUD } from '../components/PartnerHUD';
 import { VideoPlayer } from '../components/VideoPlayer';
 import { MovieLibrary } from '../components/MovieLibrary';
-import { SyncAction, PartnerState, Reaction } from '../lib/types';
-import { Tv, Sparkles, HeartHandshake, ShieldCheck, WifiOff } from 'lucide-react';
+import { ChatBox } from '../components/ChatBox';
+import { SyncAction, PartnerState, Reaction, ChatMessage } from '../lib/types';
+import { Tv, Sparkles, HeartHandshake, ShieldCheck, WifiOff, FolderOpen, MessageSquare } from 'lucide-react';
 
 export default function Home() {
   const [roomCode, setRoomCode] = useState('');
@@ -24,6 +25,8 @@ export default function Home() {
   const [partnerState, setPartnerState] = useState<PartnerState | null>(null);
   const [externalJumpTime, setExternalJumpTime] = useState<number | null>(null);
   const [reactions, setReactions] = useState<Reaction[]>([]);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [activeBottomTab, setActiveBottomTab] = useState<'library' | 'chat'>('library');
 
   // Pre-fill room code from URL query param if present
   useEffect(() => {
@@ -46,6 +49,7 @@ export default function Home() {
     sendBufferChange,
     selectMovie,
     sendReaction,
+    sendChatMessage,
   } = useSocket({
     roomCode: hasJoined ? roomCode : '',
     userName: hasJoined ? userName : '',
@@ -71,6 +75,9 @@ export default function Home() {
       setTimeout(() => {
         setReactions((prev) => prev.filter((r) => r.id !== newReaction.id));
       }, 2500);
+    },
+    onChatMessage: (message) => {
+      setChatMessages((prev) => [...prev, message]);
     },
   });
 
@@ -229,6 +236,10 @@ export default function Home() {
           incomingAction={incomingAction}
           externalJumpTime={externalJumpTime}
           reactions={reactions}
+          chatMessages={chatMessages}
+          onSendMessage={sendChatMessage}
+          onOpenChatTab={() => setActiveBottomTab('chat')}
+          userName={userName}
         />
 
         {/* The Requested Jump-To-Partner HUD */}
@@ -236,15 +247,47 @@ export default function Home() {
           myTime={myCurrentTime}
           myIsPlaying={myIsPlaying}
           partner={partnerState}
+          partnerName={partnerUser ? partnerUser.name : null}
           onJumpToPartner={handleJumpToPartner}
           onRequestPartnerJump={handleRequestPartnerJump}
         />
 
-        {/* Movie Library (Upload, Delete, Stream, Pre-download for zero buffering) */}
-        <MovieLibrary
-          currentMovie={selectedMovie}
-          onSelectMovie={handleSelectMovie}
-        />
+        {/* Bottom Tabbed Area (Library / Chat) */}
+        <div className="flex flex-col bg-neutral-900/40 border border-neutral-800 rounded-2xl overflow-hidden mt-4">
+          <div className="flex bg-neutral-900 border-b border-neutral-800 p-2 gap-2">
+            <button
+              onClick={() => setActiveBottomTab('library')}
+              className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                activeBottomTab === 'library'
+                  ? 'bg-neutral-800 text-white shadow-sm'
+                  : 'text-neutral-400 hover:bg-neutral-800/50 hover:text-neutral-200'
+              }`}
+            >
+              <FolderOpen className="w-4 h-4" />
+              Movie Library
+            </button>
+            <button
+              onClick={() => setActiveBottomTab('chat')}
+              className={`flex-1 flex items-center justify-center gap-2 py-2.5 rounded-lg text-sm font-medium transition-all ${
+                activeBottomTab === 'chat'
+                  ? 'bg-neutral-800 text-white shadow-sm'
+                  : 'text-neutral-400 hover:bg-neutral-800/50 hover:text-neutral-200'
+              }`}
+            >
+              <MessageSquare className="w-4 h-4" />
+              Room Chat
+            </button>
+          </div>
+
+          <div className="p-0">
+            <div className={activeBottomTab === 'library' ? 'block' : 'hidden'}>
+              <MovieLibrary currentMovie={selectedMovie} onSelectMovie={handleSelectMovie} />
+            </div>
+            <div className={activeBottomTab === 'chat' ? 'block' : 'hidden'}>
+              <ChatBox messages={chatMessages} onSendMessage={sendChatMessage} />
+            </div>
+          </div>
+        </div>
       </main>
     </div>
   );
