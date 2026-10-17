@@ -35,7 +35,7 @@ export default function Home() {
       const params = new URLSearchParams(window.location.search);
       const roomParam = params.get('room');
       if (roomParam) {
-        setRoomCode(roomParam.trim());
+        setRoomCode(roomParam.trim().toLowerCase());
       }
     }
   }, []);
@@ -107,7 +107,11 @@ export default function Home() {
 
   const handleJoin = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!roomCode.trim() || !userName.trim()) return;
+    const cleanRoom = roomCode.trim().toLowerCase();
+    const cleanUser = userName.trim();
+    if (!cleanRoom || !cleanUser) return;
+    setRoomCode(cleanRoom);
+    setUserName(cleanUser);
     setHasJoined(true);
   };
 
@@ -181,10 +185,13 @@ export default function Home() {
               <input
                 type="text"
                 required
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
                 placeholder="e.g. movie-night-2"
                 value={roomCode}
-                onChange={(e) => setRoomCode(e.target.value)}
-                className="w-full px-3.5 py-2.5 bg-neutral-800 border border-neutral-700 rounded-xl text-white placeholder-neutral-500 text-sm focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500 transition-all font-mono"
+                onChange={(e) => setRoomCode(e.target.value.toLowerCase())}
+                className="w-full px-3.5 py-2.5 bg-neutral-800 border border-neutral-700 rounded-xl text-white placeholder-neutral-500 text-sm focus:outline-none focus:border-rose-500 focus:ring-1 focus:ring-rose-500 transition-all font-mono lowercase"
               />
             </div>
 
@@ -249,6 +256,7 @@ export default function Home() {
 
         {/* Video Player */}
         <VideoPlayer
+          roomCode={roomCode}
           movieFilename={selectedMovie}
           onSendSyncAction={sendSyncAction}
           onSendHeartbeat={(time, playing, buffering) => {

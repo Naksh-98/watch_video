@@ -30,3 +30,13 @@ body {
 ::-webkit-scrollbar-thumb:hover {
   background: #52525b;
 }
+
+/* Suppress native browser subtitles since we render our own high-contrast custom overlay */
+video::cue {
+  display: none !important;
+  opacity: 0 !important;
+  font-size: 0 !important;
+  color: transparent !important;
+  background: transparent !important;
+}
+

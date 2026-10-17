@@ -63,19 +63,19 @@ app.prepare().then(() => {
     let userName = 'Anonymous';
 
     socket.on('join_room', ({ roomCode, name }) => {
-      currentRoom = roomCode;
-      userName = name || 'User';
-      socket.join(roomCode);
+      currentRoom = (roomCode || '').trim().toLowerCase();
+      userName = (name || 'User').trim();
+      socket.join(currentRoom);
 
-      if (!rooms.has(roomCode)) {
-        rooms.set(roomCode, new Map());
+      if (!rooms.has(currentRoom)) {
+        rooms.set(currentRoom, new Map());
       }
-      if (!roomStates.has(roomCode)) {
-        roomStates.set(roomCode, { currentMovie: null, currentSubtitle: null });
+      if (!roomStates.has(currentRoom)) {
+        roomStates.set(currentRoom, { currentMovie: null, currentSubtitle: null });
       }
 
-      const roomUsers = rooms.get(roomCode);
-      const state = roomStates.get(roomCode);
+      const roomUsers = rooms.get(currentRoom);
+      const state = roomStates.get(currentRoom);
 
       roomUsers.set(socket.id, {
         id: socket.id,
@@ -86,7 +86,7 @@ app.prepare().then(() => {
       });
 
       // Notify others in room
-      socket.to(roomCode).emit('user_joined', {
+      socket.to(currentRoom).emit('user_joined', {
         id: socket.id,
         name: userName,
         users: Array.from(roomUsers.values()),
@@ -110,6 +110,7 @@ app.prepare().then(() => {
           vttText: data.vttText,
           filename: data.filename || 'subtitles.vtt',
           senderName: userName,
+          url: `/api/room/subtitle?room=${encodeURIComponent(currentRoom)}&t=${Date.now()}`,
         };
         roomStates.get(currentRoom).currentSubtitle = subtitleData;
 
@@ -237,6 +238,22 @@ app.prepare().then(() => {
         }
       }
     });
+  });
+
+  // ================= Live Room Subtitle API =================
+  // Serves live synchronized WebVTT subtitles over standard HTTP
+  // (Fixes iOS Safari / iPhone WebKit where blob: URLs are blocked in <track>)
+  server.get('/api/room/subtitle', (req, res) => {
+    const rawRoom = req.query.room || '';
+    const roomCode = rawRoom.trim().toLowerCase();
+    const state = roomStates.get(roomCode);
+
+    if (state && state.currentSubtitle && state.currentSubtitle.vttText) {
+      res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache');
+      return res.send(state.currentSubtitle.vttText);
+    }
+    return res.status(404).send('No active subtitles for this room');
   });
 
   // ================= Movie Library APIs =================

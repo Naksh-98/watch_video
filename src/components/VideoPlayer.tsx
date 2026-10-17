@@ -1,11 +1,87 @@
 'use client';
 
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, FolderOpen, Subtitles, AlertTriangle, Rewind, FastForward, Settings, RefreshCw, MessageSquare, X, Download, Check } from 'lucide-react';
+import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, FolderOpen, Subtitles, AlertTriangle, Rewind, FastForward, Settings, RefreshCw, MessageSquare, X, Download, Check, Sliders, Palette, RotateCcw, Type } from 'lucide-react';
 import { SyncAction, Reaction, ChatMessage, SubtitleSyncData } from '../lib/types';
 import { ChatBox } from './ChatBox';
 
+export interface SubtitleStyle {
+  fontSize: number; // in px
+  bgColor: string; // hex
+  bgOpacity: number; // 0 to 100
+  textColor: string; // hex
+  textShadow: boolean;
+  bottomOffset: number; // px from bottom
+}
+
+export const DEFAULT_SUBTITLE_STYLE: SubtitleStyle = {
+  fontSize: 18,
+  bgColor: '#000000',
+  bgOpacity: 85,
+  textColor: '#ffffff',
+  textShadow: true,
+  bottomOffset: 32,
+};
+
+const SUBTITLE_STORAGE_KEY = 'sync_cinema_subtitle_style_v1';
+
+export function hexToRgba(hex: string, opacity: number): string {
+  if (!hex) return `rgba(0, 0, 0, ${opacity / 100})`;
+  let clean = hex.replace('#', '').trim();
+  if (clean.length === 3) {
+    clean = clean.split('').map((c) => c + c).join('');
+  }
+  const intVal = parseInt(clean, 16);
+  if (isNaN(intVal)) return `rgba(0, 0, 0, ${opacity / 100})`;
+  const r = (intVal >> 16) & 255;
+  const g = (intVal >> 8) & 255;
+  const b = intVal & 255;
+  const alpha = Math.max(0, Math.min(100, opacity)) / 100;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+interface SubtitleCue {
+  start: number;
+  end: number;
+  text: string;
+}
+
+function parseVTT(vttText: string): SubtitleCue[] {
+  const cues: SubtitleCue[] = [];
+  if (!vttText) return cues;
+  const blocks = vttText.replace(/\r\n/g, '\n').split(/\n\n+/);
+  const timeRegex = /(?:(\d{2}):)?(\d{2}):(\d{2})[.,](\d{3})\s*-->\s*(?:(\d{2}):)?(\d{2}):(\d{2})[.,](\d{3})/;
+
+  for (const block of blocks) {
+    const lines = block.trim().split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const match = timeRegex.exec(lines[i]);
+      if (match) {
+        const startH = match[1] ? parseInt(match[1], 10) : 0;
+        const startM = parseInt(match[2], 10);
+        const startS = parseInt(match[3], 10);
+        const startMs = parseInt(match[4], 10);
+        const start = startH * 3600 + startM * 60 + startS + startMs / 1000;
+
+        const endH = match[5] ? parseInt(match[5], 10) : 0;
+        const endM = parseInt(match[6], 10);
+        const endS = parseInt(match[7], 10);
+        const endMs = parseInt(match[8], 10);
+        const end = endH * 3600 + endM * 60 + endS + endMs / 1000;
+
+        const text = lines.slice(i + 1).join('\n').replace(/<[^>]+>/g, '').trim();
+        if (text) {
+          cues.push({ start, end, text });
+        }
+        break;
+      }
+    }
+  }
+  return cues;
+}
+
 interface VideoPlayerProps {
+  roomCode?: string;
   movieFilename: string | null;
   onSendSyncAction: (action: 'play' | 'pause' | 'seek', time: number) => void;
   onSendHeartbeat: (time: number, isPlaying: boolean, isBuffering: boolean) => void;
@@ -22,6 +98,7 @@ interface VideoPlayerProps {
 }
 
 export const VideoPlayer: React.FC<VideoPlayerProps> = ({
+  roomCode,
   movieFilename,
   onSendSyncAction,
   onSendHeartbeat,
@@ -50,6 +127,12 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [subtitleUrl, setSubtitleUrl] = useState<string | null>(null);
   const [subtitleName, setSubtitleName] = useState<string | null>(null);
   const [subtitleSyncNotice, setSubtitleSyncNotice] = useState<string | null>(null);
+  const [subCues, setSubCues] = useState<SubtitleCue[]>([]);
+  const [activeCueText, setActiveCueText] = useState<string | null>(null);
+
+  // Subtitle Style Customization State (with localStorage persistence)
+  const [subStyle, setSubStyle] = useState<SubtitleStyle>(DEFAULT_SUBTITLE_STYLE);
+  const [showSubStyleModal, setShowSubStyleModal] = useState(false);
 
   const [showControls, setShowControls] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -62,13 +145,48 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   // Prevent sync echo feedback loops
   const isIncomingUpdateRef = useRef(false);
 
+  // Load subtitle style preference from localStorage on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(SUBTITLE_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        setSubStyle((prev) => ({ ...prev, ...parsed }));
+      }
+    } catch (e) {
+      console.warn('Could not read subtitle style from localStorage', e);
+    }
+  }, []);
+
+  const updateSubStyle = (updates: Partial<SubtitleStyle>) => {
+    setSubStyle((prev) => {
+      const next = { ...prev, ...updates };
+      try {
+        localStorage.setItem(SUBTITLE_STORAGE_KEY, JSON.stringify(next));
+      } catch (e) {
+        console.warn('Could not save subtitle style to localStorage', e);
+      }
+      return next;
+    });
+  };
+
+  const resetSubStyle = () => {
+    setSubStyle(DEFAULT_SUBTITLE_STYLE);
+    try {
+      localStorage.removeItem(SUBTITLE_STORAGE_KEY);
+    } catch (e) {}
+  };
+
   // Auto-load partner or room synced subtitles
   useEffect(() => {
     if (!syncedSubtitle || !syncedSubtitle.vttText) return;
 
     try {
-      const blob = new Blob([syncedSubtitle.vttText], { type: 'text/vtt' });
-      const url = URL.createObjectURL(blob);
+      const cues = parseVTT(syncedSubtitle.vttText);
+      setSubCues(cues);
+
+      // Prefer real HTTP URL from server (essential for iOS Safari), fallback to Blob
+      const url = syncedSubtitle.url || URL.createObjectURL(new Blob([syncedSubtitle.vttText], { type: 'text/vtt' }));
       setSubtitleUrl(url);
       setSubtitleName(syncedSubtitle.filename || 'synced_subtitles.vtt');
 
@@ -81,14 +199,34 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   }, [syncedSubtitle, userName]);
 
-  // Ensure subtitles are displayed in native video element
+  // Initial fetch for existing room subtitles if partner joined after upload
+  useEffect(() => {
+    if (!roomCode || subtitleUrl) return;
+
+    fetch(`/api/room/subtitle?room=${encodeURIComponent(roomCode.trim().toLowerCase())}`)
+      .then((res) => {
+        if (res.ok) return res.text();
+        throw new Error('No room subtitles');
+      })
+      .then((vttText) => {
+        if (vttText) {
+          const cues = parseVTT(vttText);
+          setSubCues(cues);
+          setSubtitleUrl(`/api/room/subtitle?room=${encodeURIComponent(roomCode.trim().toLowerCase())}`);
+          setSubtitleName('Room Subtitles.vtt');
+        }
+      })
+      .catch(() => {});
+  }, [roomCode, subtitleUrl]);
+
+  // Keep native track in 'hidden' mode so browser does not draw duplicate captions behind custom overlay
   useEffect(() => {
     if (videoRef.current && subtitleUrl) {
       const video = videoRef.current;
       const timer = setTimeout(() => {
         if (video.textTracks && video.textTracks.length > 0) {
           for (let i = 0; i < video.textTracks.length; i++) {
-            video.textTracks[i].mode = 'showing';
+            video.textTracks[i].mode = 'hidden';
           }
         }
       }, 100);
@@ -111,11 +249,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       clearTimeout(controlsTimeoutRef.current);
     }
     controlsTimeoutRef.current = setTimeout(() => {
-      if (isPlaying) {
+      if (isPlaying && !showSubStyleModal) {
         setShowControls(false);
       }
     }, 3500);
-  }, [isPlaying]);
+  }, [isPlaying, showSubStyleModal]);
 
   useEffect(() => {
     const handleFullscreenChange = () => {
@@ -167,6 +305,9 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         // Standard SRT to VTT converter in-browser
         vttText = 'WEBVTT\n\n' + text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
       }
+      const cues = parseVTT(vttText);
+      setSubCues(cues);
+
       const blob = new Blob([vttText], { type: 'text/vtt' });
       const url = URL.createObjectURL(blob);
       setSubtitleUrl(url);
@@ -296,7 +437,14 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   // Video Native Event Handlers
   const onTimeUpdate = () => {
     if (videoRef.current) {
-      setCurrentTime(videoRef.current.currentTime);
+      const time = videoRef.current.currentTime;
+      setCurrentTime(time);
+      if (subCues.length > 0) {
+        const cue = subCues.find((c) => time >= c.start && time <= c.end);
+        setActiveCueText(cue ? cue.text : null);
+      } else if (activeCueText) {
+        setActiveCueText(null);
+      }
     }
   };
 
@@ -413,6 +561,276 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
           </div>
         )}
 
+        {/* Universal React Subtitle Overlay (100% reliable on iPhone & all browsers) */}
+        {activeCueText && (
+          <div
+            className="absolute inset-x-4 sm:inset-x-12 flex justify-center pointer-events-none z-20"
+            style={{ bottom: `${subStyle.bottomOffset || 32}px` }}
+          >
+            <span
+              className="font-semibold px-4 py-1.5 rounded-xl border border-white/10 text-center max-w-2xl leading-relaxed whitespace-pre-line tracking-wide transition-all select-none"
+              style={{
+                backgroundColor: hexToRgba(subStyle.bgColor, subStyle.bgOpacity),
+                color: subStyle.textColor,
+                fontSize: `${subStyle.fontSize}px`,
+                textShadow: subStyle.textShadow
+                  ? '0 2px 4px rgba(0,0,0,0.95), 0 0 2px rgba(0,0,0,0.95)'
+                  : 'none',
+                boxShadow: subStyle.bgOpacity > 0 ? '0 10px 25px -5px rgba(0, 0, 0, 0.5)' : 'none',
+              }}
+            >
+              {activeCueText}
+            </span>
+          </div>
+        )}
+
+        {/* Subtitle CSS & Styling Modal (Accessible in Full-Screen and Windowed Mode) */}
+        {showSubStyleModal && (
+          <div
+            className="absolute inset-0 bg-black/75 backdrop-blur-sm z-50 flex items-center justify-center p-3 sm:p-6 animate-in fade-in duration-200 pointer-events-auto"
+            onClick={(e) => {
+              e.stopPropagation();
+              setShowSubStyleModal(false);
+            }}
+          >
+            <div
+              className="bg-neutral-900/95 border border-neutral-700/80 rounded-2xl p-4 sm:p-6 w-full max-w-md max-h-[92vh] overflow-y-auto shadow-2xl text-white flex flex-col gap-4 text-xs sm:text-sm select-none"
+              onClick={(e) => e.stopPropagation()}
+            >
+              {/* Modal Header */}
+              <div className="flex items-center justify-between border-b border-neutral-800 pb-3">
+                <div className="flex items-center gap-2">
+                  <Palette className="w-5 h-5 text-rose-500" />
+                  <div>
+                    <h3 className="font-bold text-base sm:text-lg text-white leading-tight">Subtitle Style</h3>
+                    <p className="text-[11px] text-neutral-400">Customize appearance & font size</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowSubStyleModal(false)}
+                  className="p-1.5 text-neutral-400 hover:text-white rounded-lg hover:bg-neutral-800 transition-colors"
+                  title="Close"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              {/* Live Preview Box */}
+              <div className="flex flex-col gap-1.5">
+                <div className="flex items-center justify-between">
+                  <span className="text-[11px] font-semibold text-neutral-400 uppercase tracking-wider">Live Preview</span>
+                  <span className="text-[10px] text-neutral-500">Updates in real time</span>
+                </div>
+                <div className="relative h-20 sm:h-24 rounded-xl overflow-hidden border border-neutral-800 bg-neutral-950 flex items-center justify-center p-3 shadow-inner">
+                  {/* Subtle cinema backdrop simulation */}
+                  <div className="absolute inset-0 bg-gradient-to-r from-blue-950/20 via-neutral-950 to-purple-950/20 opacity-80 pointer-events-none" />
+                  
+                  <span
+                    className="font-semibold px-3 py-1.5 rounded-xl border border-white/10 text-center max-w-full truncate z-10 transition-all leading-normal"
+                    style={{
+                      backgroundColor: hexToRgba(subStyle.bgColor, subStyle.bgOpacity),
+                      color: subStyle.textColor,
+                      fontSize: `${Math.min(subStyle.fontSize, 22)}px`,
+                      textShadow: subStyle.textShadow
+                        ? '0 2px 4px rgba(0,0,0,0.95), 0 0 2px rgba(0,0,0,0.95)'
+                        : 'none',
+                    }}
+                  >
+                    {activeCueText || 'Synchronized Subtitles Preview'}
+                  </span>
+                </div>
+              </div>
+
+              {/* Font Size Selector */}
+              <div className="flex flex-col gap-2">
+                <div className="flex justify-between items-center">
+                  <span className="font-medium text-neutral-300 flex items-center gap-1.5">
+                    <Type className="w-4 h-4 text-neutral-400" />
+                    Font Size
+                  </span>
+                  <span className="text-neutral-400 text-xs font-mono font-semibold">{subStyle.fontSize}px</span>
+                </div>
+                <div className="grid grid-cols-4 gap-1.5">
+                  {[
+                    { label: 'Small', size: 14 },
+                    { label: 'Medium', size: 18 },
+                    { label: 'Large', size: 22 },
+                    { label: 'Huge', size: 28 },
+                  ].map((item) => (
+                    <button
+                      key={item.label}
+                      onClick={() => updateSubStyle({ fontSize: item.size })}
+                      className={`py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                        subStyle.fontSize === item.size
+                          ? 'bg-rose-600 text-white border-rose-500 shadow-md shadow-rose-950'
+                          : 'bg-neutral-800 text-neutral-300 border-neutral-700 hover:bg-neutral-700'
+                      }`}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+                <input
+                  type="range"
+                  min="12"
+                  max="36"
+                  step="1"
+                  value={subStyle.fontSize}
+                  onChange={(e) => updateSubStyle({ fontSize: parseInt(e.target.value, 10) })}
+                  className="w-full h-1.5 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-rose-500"
+                />
+              </div>
+
+              {/* Background Opacity / Transparency */}
+              <div className="flex flex-col gap-2">
+                <div className="flex justify-between items-center">
+                  <span className="font-medium text-neutral-300">Background Transparency</span>
+                  <span className="text-neutral-400 text-xs font-mono font-semibold">{subStyle.bgOpacity}%</span>
+                </div>
+                <div className="grid grid-cols-4 gap-1.5">
+                  {[
+                    { label: '0% (Clear)', val: 0 },
+                    { label: '50%', val: 50 },
+                    { label: '85%', val: 85 },
+                    { label: '100% (Solid)', val: 100 },
+                  ].map((item) => (
+                    <button
+                      key={item.label}
+                      onClick={() => updateSubStyle({ bgOpacity: item.val })}
+                      className={`py-1.5 rounded-lg text-xs font-medium border transition-colors ${
+                        subStyle.bgOpacity === item.val
+                          ? 'bg-rose-600 text-white border-rose-500 shadow-md shadow-rose-950'
+                          : 'bg-neutral-800 text-neutral-300 border-neutral-700 hover:bg-neutral-700'
+                      }`}
+                    >
+                      {item.label}
+                    </button>
+                  ))}
+                </div>
+                <input
+                  type="range"
+                  min="0"
+                  max="100"
+                  step="5"
+                  value={subStyle.bgOpacity}
+                  onChange={(e) => updateSubStyle({ bgOpacity: parseInt(e.target.value, 10) })}
+                  className="w-full h-1.5 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-rose-500"
+                />
+              </div>
+
+              {/* Background Color Swatches + Custom Picker */}
+              <div className="flex flex-col gap-2">
+                <span className="font-medium text-neutral-300">Background Color</span>
+                <div className="flex items-center gap-2.5 flex-wrap">
+                  {[
+                    { label: 'Black', hex: '#000000' },
+                    { label: 'Slate', hex: '#0f172a' },
+                    { label: 'Charcoal', hex: '#18181b' },
+                    { label: 'Navy', hex: '#1e3a8a' },
+                    { label: 'Wine', hex: '#4c0519' },
+                    { label: 'Emerald', hex: '#064e3b' },
+                  ].map((color) => (
+                    <button
+                      key={color.hex}
+                      onClick={() => updateSubStyle({ bgColor: color.hex })}
+                      style={{ backgroundColor: color.hex }}
+                      className={`w-7 h-7 rounded-full border-2 transition-transform hover:scale-110 flex items-center justify-center shadow-md ${
+                        subStyle.bgColor.toLowerCase() === color.hex.toLowerCase()
+                          ? 'border-white scale-110 ring-2 ring-rose-500'
+                          : 'border-neutral-600'
+                      }`}
+                      title={color.label}
+                    >
+                      {subStyle.bgColor.toLowerCase() === color.hex.toLowerCase() && (
+                        <Check className="w-3.5 h-3.5 text-white drop-shadow" />
+                      )}
+                    </button>
+                  ))}
+
+                  {/* Custom Color Input */}
+                  <label
+                    className="flex items-center gap-1.5 px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg cursor-pointer text-xs transition-colors"
+                    title="Custom background color"
+                  >
+                    <input
+                      type="color"
+                      value={subStyle.bgColor}
+                      onChange={(e) => updateSubStyle({ bgColor: e.target.value })}
+                      className="w-4 h-4 rounded cursor-pointer border-0 bg-transparent p-0"
+                    />
+                    <span className="text-[11px] text-neutral-300">Custom</span>
+                  </label>
+                </div>
+              </div>
+
+              {/* Text Color Swatches + Custom Picker */}
+              <div className="flex flex-col gap-2">
+                <span className="font-medium text-neutral-300">Text Color</span>
+                <div className="flex items-center gap-2.5 flex-wrap">
+                  {[
+                    { label: 'White', hex: '#ffffff' },
+                    { label: 'Cinema Yellow', hex: '#facc15' },
+                    { label: 'Cyan', hex: '#38bdf8' },
+                    { label: 'Mint Green', hex: '#4ade80' },
+                  ].map((color) => (
+                    <button
+                      key={color.hex}
+                      onClick={() => updateSubStyle({ textColor: color.hex })}
+                      style={{ backgroundColor: color.hex }}
+                      className={`w-7 h-7 rounded-full border-2 transition-transform hover:scale-110 flex items-center justify-center shadow-md ${
+                        subStyle.textColor.toLowerCase() === color.hex.toLowerCase()
+                          ? 'border-neutral-900 scale-110 ring-2 ring-rose-500'
+                          : 'border-neutral-600'
+                      }`}
+                      title={color.label}
+                    >
+                      {subStyle.textColor.toLowerCase() === color.hex.toLowerCase() && (
+                        <Check className="w-3.5 h-3.5 text-black drop-shadow" />
+                      )}
+                    </button>
+                  ))}
+
+                  {/* Custom Text Color Input */}
+                  <label
+                    className="flex items-center gap-1.5 px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 rounded-lg cursor-pointer text-xs transition-colors"
+                    title="Custom text color"
+                  >
+                    <input
+                      type="color"
+                      value={subStyle.textColor}
+                      onChange={(e) => updateSubStyle({ textColor: e.target.value })}
+                      className="w-4 h-4 rounded cursor-pointer border-0 bg-transparent p-0"
+                    />
+                    <span className="text-[11px] text-neutral-300">Custom</span>
+                  </label>
+                </div>
+              </div>
+
+              {/* Footer Info & Reset */}
+              <div className="flex items-center justify-between pt-3 border-t border-neutral-800 text-xs">
+                <button
+                  onClick={resetSubStyle}
+                  className="flex items-center gap-1.5 text-neutral-400 hover:text-rose-400 transition-colors"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Reset Default</span>
+                </button>
+                <button
+                  onClick={() => setShowSubStyleModal(false)}
+                  className="px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-medium rounded-lg shadow-md transition-colors"
+                >
+                  Done
+                </button>
+              </div>
+
+              <div className="flex items-center justify-center gap-1.5 text-[11px] text-emerald-400/90 -mt-2">
+                <Check className="w-3 h-3" />
+                <span>Preferences automatically saved to local storage</span>
+              </div>
+            </div>
+          </div>
+        )}
+
         {/* Subtitle-like Chat Popup */}
         {latestPopupMsg && !showChatOverlay && (
           <div className="absolute top-6 left-6 flex justify-start pointer-events-none z-30">
@@ -476,6 +894,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                     </div>
                   )}
                 </div>
+
+                <button
+                  onClick={(e) => { e.stopPropagation(); setShowSubStyleModal((prev) => !prev); }}
+                  className={`px-3 py-1.5 rounded-full backdrop-blur-md flex items-center gap-1.5 text-xs sm:text-sm font-medium transition-colors ${
+                    showSubStyleModal
+                      ? 'bg-rose-600 text-white shadow-lg shadow-rose-900/50'
+                      : 'bg-black/50 hover:bg-neutral-700 text-white'
+                  }`}
+                  title="Subtitle Style & Appearance (Font size, background color, opacity)"
+                >
+                  <Sliders className="w-3.5 h-3.5 text-rose-300" />
+                  <span className="hidden sm:inline">Sub Style</span>
+                </button>
               </div>
 
               {isFullscreen && (
@@ -611,20 +1042,23 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
             {/* Subtitle Selector / Status & Download */}
             {subtitleUrl ? (
-              <div className="flex items-center gap-1.5 bg-blue-950/40 border border-blue-500/30 rounded-lg px-2 py-1 text-blue-300 text-xs">
-                <Subtitles className="w-3.5 h-3.5 text-blue-400" />
-                <span className="max-w-[70px] sm:max-w-[130px] truncate text-[11px] font-semibold text-blue-200" title={subtitleName || 'Subtitles active'}>
+              <div className="flex items-center gap-1.5 bg-blue-950/60 border border-blue-500/40 rounded-lg px-2 py-1 text-blue-300 text-xs shadow-sm">
+                <Subtitles className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                <span className="max-w-[60px] sm:max-w-[120px] truncate text-[11px] font-semibold text-blue-200" title={subtitleName || 'Subtitles active'}>
                   {subtitleName || 'CC On'}
                 </span>
-                <button
-                  onClick={handleDownloadSubtitle}
+                <a
+                  href={subtitleUrl}
+                  download={subtitleName || 'subtitles.vtt'}
+                  target="_blank"
+                  rel="noopener noreferrer"
                   className="p-1 hover:text-white transition-colors"
-                  title="Download this subtitle file (.vtt)"
+                  title="Download subtitle file (.vtt)"
                 >
                   <Download className="w-3.5 h-3.5 text-blue-400 hover:text-blue-100" />
-                </button>
+                </a>
                 <button
-                  onClick={(e) => { e.stopPropagation(); setSubtitleUrl(null); setSubtitleName(null); }}
+                  onClick={(e) => { e.stopPropagation(); setSubtitleUrl(null); setSubtitleName(null); setSubCues([]); setActiveCueText(null); }}
                   className="p-1 hover:text-rose-400 transition-colors"
                   title="Turn off subtitles"
                 >
@@ -633,11 +1067,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               </div>
             ) : (
               <label
-                className="flex items-center gap-1.5 px-2.5 py-1.5 bg-neutral-800 hover:bg-neutral-700 active:scale-95 text-neutral-300 rounded-lg cursor-pointer transition-all border border-neutral-700"
+                className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 bg-neutral-800 hover:bg-neutral-700 active:scale-95 text-neutral-300 rounded-lg cursor-pointer transition-all border border-neutral-700"
                 title="Add Subtitle (.srt or .vtt) - Automatically syncs to partner!"
               >
-                <Subtitles className="w-3.5 h-3.5 text-blue-400" />
-                <span className="hidden sm:inline">Add Subtitle</span>
+                <Subtitles className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                <span className="text-[11px] font-medium">Sub</span>
                 <input
                   type="file"
                   accept=".srt,.vtt"
@@ -646,6 +1080,19 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
                 />
               </label>
             )}
+
+            {/* Subtitle Style Settings Button */}
+            <button
+              onClick={() => setShowSubStyleModal((prev) => !prev)}
+              className={`p-1.5 rounded-lg transition-colors ${
+                showSubStyleModal
+                  ? 'bg-rose-600 text-white shadow-md shadow-rose-950'
+                  : 'hover:bg-neutral-800 text-neutral-400 hover:text-white'
+              }`}
+              title="Subtitle Style & Appearance (Font size, background color, opacity)"
+            >
+              <Sliders className="w-4 h-4" />
+            </button>
 
             {/* Fullscreen Button */}
             <button

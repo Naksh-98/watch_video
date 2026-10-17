@@ -49,5 +49,6 @@ export interface SubtitleSyncData {
   vttText: string;
   filename: string;
   senderName?: string;
+  url?: string;
 }
 
