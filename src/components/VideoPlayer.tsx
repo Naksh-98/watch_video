@@ -1,8 +1,8 @@
 'use client';
 
 import React, { useRef, useEffect, useState, useCallback } from 'react';
-import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, FolderOpen, Subtitles, AlertTriangle, Rewind, FastForward, Settings, RefreshCw, MessageSquare, X } from 'lucide-react';
-import { SyncAction, Reaction, ChatMessage } from '../lib/types';
+import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, FolderOpen, Subtitles, AlertTriangle, Rewind, FastForward, Settings, RefreshCw, MessageSquare, X, Download, Check } from 'lucide-react';
+import { SyncAction, Reaction, ChatMessage, SubtitleSyncData } from '../lib/types';
 import { ChatBox } from './ChatBox';
 
 interface VideoPlayerProps {
@@ -17,6 +17,8 @@ interface VideoPlayerProps {
   onSendMessage: (text: string) => void;
   onOpenChatTab: () => void;
   userName: string;
+  syncedSubtitle?: SubtitleSyncData | null;
+  onSendSubtitle?: (vttText: string, filename: string) => void;
 }
 
 export const VideoPlayer: React.FC<VideoPlayerProps> = ({
@@ -31,6 +33,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   onSendMessage,
   onOpenChatTab,
   userName,
+  syncedSubtitle,
+  onSendSubtitle,
 }) => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -44,6 +48,8 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [localFileUrl, setLocalFileUrl] = useState<string | null>(null);
   const [localFileName, setLocalFileName] = useState<string | null>(null);
   const [subtitleUrl, setSubtitleUrl] = useState<string | null>(null);
+  const [subtitleName, setSubtitleName] = useState<string | null>(null);
+  const [subtitleSyncNotice, setSubtitleSyncNotice] = useState<string | null>(null);
 
   const [showControls, setShowControls] = useState(true);
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -55,6 +61,40 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
 
   // Prevent sync echo feedback loops
   const isIncomingUpdateRef = useRef(false);
+
+  // Auto-load partner or room synced subtitles
+  useEffect(() => {
+    if (!syncedSubtitle || !syncedSubtitle.vttText) return;
+
+    try {
+      const blob = new Blob([syncedSubtitle.vttText], { type: 'text/vtt' });
+      const url = URL.createObjectURL(blob);
+      setSubtitleUrl(url);
+      setSubtitleName(syncedSubtitle.filename || 'synced_subtitles.vtt');
+
+      if (syncedSubtitle.senderName && syncedSubtitle.senderName !== userName) {
+        setSubtitleSyncNotice(`✨ Subtitles synced by ${syncedSubtitle.senderName}`);
+        setTimeout(() => setSubtitleSyncNotice(null), 4000);
+      }
+    } catch (err) {
+      console.error('Failed to parse synced subtitle:', err);
+    }
+  }, [syncedSubtitle, userName]);
+
+  // Ensure subtitles are displayed in native video element
+  useEffect(() => {
+    if (videoRef.current && subtitleUrl) {
+      const video = videoRef.current;
+      const timer = setTimeout(() => {
+        if (video.textTracks && video.textTracks.length > 0) {
+          for (let i = 0; i < video.textTracks.length; i++) {
+            video.textTracks[i].mode = 'showing';
+          }
+        }
+      }, 100);
+      return () => clearTimeout(timer);
+    }
+  }, [subtitleUrl]);
 
   // Determine active video source (Local file -> Direct URL -> Server HTTP 206 Stream)
   const videoSrc = localFileUrl || (
@@ -114,25 +154,42 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     }
   };
 
-  // Handle Subtitle file upload (.vtt or .srt)
+  // Handle Subtitle file upload (.vtt or .srt) & broadcast to partner
   const handleSubtitleSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (file.name.endsWith('.vtt')) {
-      const url = URL.createObjectURL(file);
+    const reader = new FileReader();
+    reader.onload = () => {
+      let text = reader.result as string;
+      let vttText = text;
+      if (!file.name.endsWith('.vtt')) {
+        // Standard SRT to VTT converter in-browser
+        vttText = 'WEBVTT\n\n' + text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+      }
+      const blob = new Blob([vttText], { type: 'text/vtt' });
+      const url = URL.createObjectURL(blob);
       setSubtitleUrl(url);
-    } else {
-      // Basic SRT to VTT converter in-browser
-      const reader = new FileReader();
-      reader.onload = () => {
-        let text = reader.result as string;
-        let vttText = 'WEBVTT\n\n' + text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
-        const blob = new Blob([vttText], { type: 'text/vtt' });
-        setSubtitleUrl(URL.createObjectURL(blob));
-      };
-      reader.readAsText(file);
-    }
+      setSubtitleName(file.name);
+
+      // Broadcast subtitle directly to partner so she doesn't need to do anything!
+      if (onSendSubtitle) {
+        onSendSubtitle(vttText, file.name);
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  // Download the currently active subtitle file
+  const handleDownloadSubtitle = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!subtitleUrl) return;
+    const a = document.createElement('a');
+    a.href = subtitleUrl;
+    a.download = subtitleName || 'subtitles.vtt';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
   // Play / Pause Toggle
@@ -317,7 +374,7 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             onClick={togglePlay}
           >
             {subtitleUrl && (
-              <track src={subtitleUrl} kind="subtitles" srcLang="en" label="English" default />
+              <track key={subtitleUrl} src={subtitleUrl} kind="subtitles" srcLang="en" label="English" default />
             )}
           </video>
         ) : (
@@ -345,6 +402,16 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
             </div>
           ))}
         </div>
+
+        {/* Floating Subtitle Synced Notification */}
+        {subtitleSyncNotice && (
+          <div className="absolute top-6 left-1/2 -translate-x-1/2 flex justify-center pointer-events-none z-30 animate-in fade-in slide-in-from-top-3 duration-300">
+            <div className="bg-blue-600/95 text-white font-semibold text-xs sm:text-sm px-4 py-2 rounded-full shadow-2xl backdrop-blur-md border border-blue-400/40 flex items-center gap-2">
+              <Subtitles className="w-4 h-4 text-blue-200" />
+              <span>{subtitleSyncNotice}</span>
+            </div>
+          </div>
+        )}
 
         {/* Subtitle-like Chat Popup */}
         {latestPopupMsg && !showChatOverlay && (
@@ -542,19 +609,43 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
               />
             </label>
 
-            {/* Subtitle Selector */}
-            <label
-              className="flex items-center gap-1 px-2 py-1.5 bg-neutral-800 hover:bg-neutral-700 active:scale-95 text-neutral-300 rounded-lg cursor-pointer transition-all border border-neutral-700"
-              title="Load Subtitle file (.srt or .vtt)"
-            >
-              <Subtitles className="w-3.5 h-3.5 text-blue-400" />
-              <input
-                type="file"
-                accept=".srt,.vtt"
-                onChange={handleSubtitleSelect}
-                className="hidden"
-              />
-            </label>
+            {/* Subtitle Selector / Status & Download */}
+            {subtitleUrl ? (
+              <div className="flex items-center gap-1.5 bg-blue-950/40 border border-blue-500/30 rounded-lg px-2 py-1 text-blue-300 text-xs">
+                <Subtitles className="w-3.5 h-3.5 text-blue-400" />
+                <span className="max-w-[70px] sm:max-w-[130px] truncate text-[11px] font-semibold text-blue-200" title={subtitleName || 'Subtitles active'}>
+                  {subtitleName || 'CC On'}
+                </span>
+                <button
+                  onClick={handleDownloadSubtitle}
+                  className="p-1 hover:text-white transition-colors"
+                  title="Download this subtitle file (.vtt)"
+                >
+                  <Download className="w-3.5 h-3.5 text-blue-400 hover:text-blue-100" />
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); setSubtitleUrl(null); setSubtitleName(null); }}
+                  className="p-1 hover:text-rose-400 transition-colors"
+                  title="Turn off subtitles"
+                >
+                  <X className="w-3.5 h-3.5 text-neutral-400 hover:text-rose-400" />
+                </button>
+              </div>
+            ) : (
+              <label
+                className="flex items-center gap-1.5 px-2.5 py-1.5 bg-neutral-800 hover:bg-neutral-700 active:scale-95 text-neutral-300 rounded-lg cursor-pointer transition-all border border-neutral-700"
+                title="Add Subtitle (.srt or .vtt) - Automatically syncs to partner!"
+              >
+                <Subtitles className="w-3.5 h-3.5 text-blue-400" />
+                <span className="hidden sm:inline">Add Subtitle</span>
+                <input
+                  type="file"
+                  accept=".srt,.vtt"
+                  onChange={handleSubtitleSelect}
+                  className="hidden"
+                />
+              </label>
+            )}
 
             {/* Fullscreen Button */}
             <button

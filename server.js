@@ -55,6 +55,8 @@ app.prepare().then(() => {
   // Track rooms and members
   // roomCode -> { users: Map(socketId, { name, currentTime, isPlaying, isBuffering }) }
   const rooms = new Map();
+  // roomCode -> { currentMovie: null, currentSubtitle: null }
+  const roomStates = new Map();
 
   io.on('connection', (socket) => {
     let currentRoom = null;
@@ -68,7 +70,13 @@ app.prepare().then(() => {
       if (!rooms.has(roomCode)) {
         rooms.set(roomCode, new Map());
       }
+      if (!roomStates.has(roomCode)) {
+        roomStates.set(roomCode, { currentMovie: null, currentSubtitle: null });
+      }
+
       const roomUsers = rooms.get(roomCode);
+      const state = roomStates.get(roomCode);
+
       roomUsers.set(socket.id, {
         id: socket.id,
         name: userName,
@@ -84,10 +92,30 @@ app.prepare().then(() => {
         users: Array.from(roomUsers.values()),
       });
 
-      // Send existing state to newcomer
+      // Send existing state to newcomer (including current movie and synced subtitles)
       socket.emit('room_info', {
         users: Array.from(roomUsers.values()),
+        currentMovie: state ? state.currentMovie : null,
+        currentSubtitle: state ? state.currentSubtitle : null,
       });
+    });
+
+    // Subtitle Sync across room (when host uploads or changes subtitles)
+    socket.on('sync_subtitle', (data) => {
+      if (currentRoom) {
+        if (!roomStates.has(currentRoom)) {
+          roomStates.set(currentRoom, { currentMovie: null, currentSubtitle: null });
+        }
+        const subtitleData = {
+          vttText: data.vttText,
+          filename: data.filename || 'subtitles.vtt',
+          senderName: userName,
+        };
+        roomStates.get(currentRoom).currentSubtitle = subtitleData;
+
+        // Broadcast to partner in the room
+        socket.to(currentRoom).emit('subtitle_synced', subtitleData);
+      }
     });
 
     // Player Play / Pause / Seek events
@@ -136,6 +164,10 @@ app.prepare().then(() => {
     // Video Selection across room
     socket.on('select_movie', (data) => {
       if (currentRoom) {
+        if (!roomStates.has(currentRoom)) {
+          roomStates.set(currentRoom, { currentMovie: null, currentSubtitle: null });
+        }
+        roomStates.get(currentRoom).currentMovie = data.filename;
         io.to(currentRoom).emit('movie_selected', {
           ...data,
           senderName: userName,
@@ -195,6 +227,7 @@ app.prepare().then(() => {
         roomUsers.delete(socket.id);
         if (roomUsers.size === 0) {
           rooms.delete(currentRoom);
+          roomStates.delete(currentRoom);
         } else {
           socket.to(currentRoom).emit('user_left', {
             id: socket.id,
@@ -208,7 +241,7 @@ app.prepare().then(() => {
 
   // ================= Movie Library APIs =================
 
-  // 1. List all available movies in movies/ folder (including cloud links)
+  // 1. List all available movies in movies/ folder (including cloud links & subtitle detection)
   server.get('/api/movies', (req, res) => {
     let cloudMovies = [];
     if (fs.existsSync(CLOUD_MOVIES_FILE)) {
@@ -223,7 +256,7 @@ app.prepare().then(() => {
       }
 
       const localMovies = files
-        .filter((file) => !file.startsWith('.') && file !== 'cloud_movies.json')
+        .filter((file) => !file.startsWith('.') && file !== 'cloud_movies.json' && !file.endsWith('.srt') && !file.endsWith('.vtt'))
         .map((file) => {
           const filePath = path.join(MOVIES_DIR, file);
           const stats = fs.statSync(filePath);
@@ -231,16 +264,62 @@ app.prepare().then(() => {
           const sizeGB = (stats.size / (1024 * 1024 * 1024)).toFixed(2);
           const formattedSize = stats.size > 1024 * 1024 * 1024 ? `${sizeGB} GB` : `${sizeMB} MB`;
 
+          const ext = path.extname(file);
+          const baseName = path.basename(file, ext);
+          const srtPath = path.join(MOVIES_DIR, `${baseName}.srt`);
+          const vttPath = path.join(MOVIES_DIR, `${baseName}.vtt`);
+          const hasSubtitle = fs.existsSync(srtPath) || fs.existsSync(vttPath);
+
           return {
             filename: file,
             size: stats.size,
             formattedSize,
             modifiedAt: stats.mtime,
             isCloud: false,
+            hasSubtitle,
+            subtitleUrl: hasSubtitle ? `/api/movies/subtitle/${encodeURIComponent(file)}` : null,
           };
         });
 
       res.json([...cloudMovies, ...localMovies]);
+    });
+  });
+
+  // 1b. Serve subtitle for movie (converts .srt to .vtt on the fly for native browser support)
+  server.get('/api/movies/subtitle/:filename', (req, res) => {
+    const filename = req.params.filename;
+    const safeFilename = path.basename(filename);
+    const ext = path.extname(safeFilename);
+    const baseName = path.basename(safeFilename, ext);
+
+    const vttPath = path.join(MOVIES_DIR, `${baseName}.vtt`);
+    const srtPath = path.join(MOVIES_DIR, `${baseName}.srt`);
+
+    if (fs.existsSync(vttPath)) {
+      res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+      return fs.createReadStream(vttPath).pipe(res);
+    } else if (fs.existsSync(srtPath)) {
+      try {
+        const srtContent = fs.readFileSync(srtPath, 'utf-8');
+        const vttContent = 'WEBVTT\n\n' + srtContent.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
+        res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+        return res.send(vttContent);
+      } catch (err) {
+        return res.status(500).send('Error reading subtitle');
+      }
+    } else {
+      return res.status(404).send('Subtitle not found');
+    }
+  });
+
+  // 1c. Subtitle upload endpoint
+  server.post('/api/movies/upload-subtitle', upload.single('subtitle'), (req, res) => {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No subtitle file provided' });
+    }
+    res.json({
+      success: true,
+      filename: req.file.filename,
     });
   });
 

@@ -9,7 +9,7 @@ import { PartnerHUD } from '../components/PartnerHUD';
 import { VideoPlayer } from '../components/VideoPlayer';
 import { MovieLibrary } from '../components/MovieLibrary';
 import { ChatBox } from '../components/ChatBox';
-import { SyncAction, PartnerState, Reaction, ChatMessage } from '../lib/types';
+import { SyncAction, PartnerState, Reaction, ChatMessage, SubtitleSyncData } from '../lib/types';
 import { Tv, Sparkles, HeartHandshake, ShieldCheck, WifiOff, FolderOpen, MessageSquare } from 'lucide-react';
 
 export default function Home() {
@@ -27,6 +27,7 @@ export default function Home() {
   const [reactions, setReactions] = useState<Reaction[]>([]);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [activeBottomTab, setActiveBottomTab] = useState<'library' | 'chat'>('library');
+  const [syncedSubtitle, setSyncedSubtitle] = useState<SubtitleSyncData | null>(null);
 
   // Pre-fill room code from URL query param if present
   useEffect(() => {
@@ -48,6 +49,7 @@ export default function Home() {
     sendHeartbeat,
     sendBufferChange,
     selectMovie,
+    sendSubtitle,
     sendReaction,
     sendChatMessage,
   } = useSocket({
@@ -64,6 +66,9 @@ export default function Home() {
     },
     onMovieSelected: (data) => {
       setSelectedMovie(data.filename);
+    },
+    onSubtitleSync: (data) => {
+      setSyncedSubtitle(data);
     },
     onReaction: (data) => {
       const newReaction: Reaction = {
@@ -116,9 +121,28 @@ export default function Home() {
     sendSyncAction('seek', myCurrentTime);
   };
 
-  const handleSelectMovie = (filename: string) => {
+  const handleSelectMovie = (filename: string, subtitleUrl?: string | null) => {
     setSelectedMovie(filename);
     selectMovie(filename);
+
+    // If movie has subtitles on server, automatically fetch and sync to room!
+    if (subtitleUrl) {
+      fetch(subtitleUrl)
+        .then((res) => {
+          if (res.ok) return res.text();
+          throw new Error('Subtitle not found');
+        })
+        .then((vttText) => {
+          const subData = {
+            vttText,
+            filename: `${filename}.vtt`,
+            senderName: userName,
+          };
+          setSyncedSubtitle(subData);
+          sendSubtitle(vttText, `${filename}.vtt`);
+        })
+        .catch(() => {});
+    }
   };
 
   if (!hasJoined) {
@@ -240,6 +264,8 @@ export default function Home() {
           onSendMessage={sendChatMessage}
           onOpenChatTab={() => setActiveBottomTab('chat')}
           userName={userName}
+          syncedSubtitle={syncedSubtitle}
+          onSendSubtitle={sendSubtitle}
         />
 
         {/* The Requested Jump-To-Partner HUD */}

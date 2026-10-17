@@ -1,11 +1,11 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
-import { Upload, Trash2, Film, Download, Play, RefreshCw, HardDrive, CheckCircle2, Link } from 'lucide-react';
+import { Upload, Trash2, Film, Download, Play, RefreshCw, HardDrive, CheckCircle2, Link, Subtitles } from 'lucide-react';
 import { MovieItem } from '../lib/types';
 
 interface MovieLibraryProps {
-  onSelectMovie: (filename: string) => void;
+  onSelectMovie: (filename: string, subtitleUrl?: string | null) => void;
   currentMovie: string | null;
 }
 
@@ -219,9 +219,16 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
                 <div className="flex items-center gap-2.5 min-w-0">
                   <Film className={`w-4 h-4 shrink-0 ${isSelected ? 'text-rose-400' : 'text-neutral-400'}`} />
                   <div className="truncate">
-                    <p className={`text-xs font-semibold truncate ${isSelected ? 'text-rose-300' : 'text-white'}`}>
-                      {movie.filename}
-                    </p>
+                    <div className="flex items-center gap-1.5 truncate">
+                      <p className={`text-xs font-semibold truncate ${isSelected ? 'text-rose-300' : 'text-white'}`}>
+                        {movie.filename}
+                      </p>
+                      {movie.hasSubtitle && (
+                        <span className="text-[9px] font-bold bg-blue-500/20 text-blue-400 px-1.5 py-0.2 rounded border border-blue-500/30 shrink-0" title="Subtitles available">
+                          CC
+                        </span>
+                      )}
+                    </div>
                     <p className="text-[10px] text-neutral-400">
                       {movie.formattedSize}
                     </p>
@@ -231,7 +238,7 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
                 <div className="flex items-center gap-1.5 self-end sm:self-center shrink-0">
                   {/* Select to Watch */}
                   <button
-                    onClick={() => onSelectMovie(movieKey)}
+                    onClick={() => onSelectMovie(movieKey, movie.subtitleUrl)}
                     className={`flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium transition-all ${
                       isSelected
                         ? 'bg-rose-600 text-white'
@@ -243,7 +250,7 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
                     <span>{isSelected ? 'Playing' : 'Watch'}</span>
                   </button>
 
-                  {/* Pre-download button for Slow Internet / Zero Buffering */}
+                  {/* Pre-download video button for Slow Internet / Zero Buffering */}
                   {movie.isCloud ? (
                     <a
                       href={movie.url}
@@ -265,6 +272,19 @@ export const MovieLibrary: React.FC<MovieLibraryProps> = ({ onSelectMovie, curre
                     >
                       <Download className="w-3.5 h-3.5 text-emerald-400" />
                       <span className="hidden sm:inline">Save</span>
+                    </a>
+                  )}
+
+                  {/* Subtitle download button if available */}
+                  {movie.hasSubtitle && (
+                    <a
+                      href={`/api/movies/subtitle/${encodeURIComponent(movie.filename)}`}
+                      download={`${movie.filename.substring(0, movie.filename.lastIndexOf('.')) || movie.filename}.vtt`}
+                      className="flex items-center gap-1 px-2 py-1 bg-blue-950/40 hover:bg-blue-900/60 text-blue-300 border border-blue-500/20 rounded-md text-xs transition-colors"
+                      title="Download matching subtitles (.vtt)"
+                    >
+                      <Subtitles className="w-3.5 h-3.5 text-blue-400" />
+                      <span className="hidden sm:inline">Sub</span>
                     </a>
                   )}
 

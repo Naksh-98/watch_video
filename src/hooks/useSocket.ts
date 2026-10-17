@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { RoomUser, SyncAction, PartnerState, ChatMessage } from '../lib/types';
+import { RoomUser, SyncAction, PartnerState, ChatMessage, SubtitleSyncData } from '../lib/types';
 
 interface UseSocketProps {
   roomCode: string;
@@ -9,6 +9,7 @@ interface UseSocketProps {
   onPartnerHeartbeat?: (partner: PartnerState) => void;
   onBufferChange?: (data: { senderName: string; isBuffering: boolean }) => void;
   onMovieSelected?: (data: { filename: string; senderName: string }) => void;
+  onSubtitleSync?: (data: SubtitleSyncData) => void;
   onReaction?: (data: { emoji: string; senderName: string }) => void;
   onChatMessage?: (message: ChatMessage) => void;
   onUserJoined?: (user: { id: string; name: string }) => void;
@@ -22,6 +23,7 @@ export function useSocket({
   onPartnerHeartbeat,
   onBufferChange,
   onMovieSelected,
+  onSubtitleSync,
   onReaction,
   onChatMessage,
   onUserJoined,
@@ -47,8 +49,14 @@ export function useSocket({
       setIsConnected(false);
     });
 
-    socket.on('room_info', (data: { users: RoomUser[] }) => {
+    socket.on('room_info', (data: { users: RoomUser[]; currentMovie?: string; currentSubtitle?: SubtitleSyncData }) => {
       setUsers(data.users);
+      if (data.currentMovie && onMovieSelected) {
+        onMovieSelected({ filename: data.currentMovie, senderName: 'Room' });
+      }
+      if (data.currentSubtitle && onSubtitleSync) {
+        onSubtitleSync(data.currentSubtitle);
+      }
     });
 
     socket.on('user_joined', (data: { id: string; name: string; users: RoomUser[] }) => {
@@ -75,6 +83,10 @@ export function useSocket({
 
     socket.on('movie_selected', (data: { filename: string; senderName: string }) => {
       if (onMovieSelected) onMovieSelected(data);
+    });
+
+    socket.on('subtitle_synced', (data: SubtitleSyncData) => {
+      if (onSubtitleSync) onSubtitleSync(data);
     });
 
     socket.on('reaction_received', (data: { emoji: string; senderName: string }) => {
@@ -114,6 +126,12 @@ export function useSocket({
     }
   };
 
+  const sendSubtitle = (vttText: string, filename: string) => {
+    if (socketRef.current?.connected) {
+      socketRef.current.emit('sync_subtitle', { vttText, filename });
+    }
+  };
+
   const sendReaction = (emoji: string) => {
     if (socketRef.current?.connected) {
       socketRef.current.emit('send_reaction', { emoji });
@@ -134,6 +152,7 @@ export function useSocket({
     sendHeartbeat,
     sendBufferChange,
     selectMovie,
+    sendSubtitle,
     sendReaction,
     sendChatMessage,
   };

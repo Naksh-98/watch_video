@@ -28,6 +28,8 @@ export interface MovieItem {
   modifiedAt: string;
   url?: string;
   isCloud?: boolean;
+  hasSubtitle?: boolean;
+  subtitleUrl?: string | null;
 }
 
 export interface Reaction {
@@ -42,3 +44,10 @@ export interface ChatMessage {
   senderName: string;
   timestamp: number;
 }
+
+export interface SubtitleSyncData {
+  vttText: string;
+  filename: string;
+  senderName?: string;
+}
+
