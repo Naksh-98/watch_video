@@ -5,16 +5,23 @@ import { Play, Pause, Volume2, VolumeX, Maximize, Minimize, FolderOpen, Subtitle
 import { SyncAction, Reaction, ChatMessage, SubtitleSyncData } from '../lib/types';
 import {
   AudioTrackOption,
+  MediaTracksInspectionResult,
+  SubtitleTrackOption,
   VideoElementWithAudioTracks,
   extractNativeAudioTracks,
-  inspectLocalVideoAudioTracks,
-  inspectStreamAudioTracks,
+  extractNativeTextTracks,
+  inspectLocalVideoMediaTracks,
+  inspectStreamMediaTracks,
 } from '../lib/audioTracks';
 import {
   MseAudioTrackController,
   isTimeBufferedOnAudio,
   openAudioTrackSource,
 } from '../lib/mseAudioPlayer';
+import {
+  EmbeddedSubtitleController,
+  openEmbeddedSubtitleSource,
+} from '../lib/subtitleExtractor';
 import { ChatBox } from './ChatBox';
 
 export interface SubtitleStyle {
@@ -146,6 +153,24 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
   const [subStyle, setSubStyle] = useState<SubtitleStyle>(DEFAULT_SUBTITLE_STYLE);
   const [showSubStyleModal, setShowSubStyleModal] = useState(false);
 
+  // Embedded & Native Subtitle Track State
+  const externalTrackElRef = useRef<HTMLTrackElement | null>(null);
+  const nativeTextTrackRefs = useRef<TextTrack[]>([]);
+  const activeNativeTextTrackRef = useRef<TextTrack | null>(null);
+  const subControllerRef = useRef<EmbeddedSubtitleController | null>(null);
+  const subSwitchIdRef = useRef(0);
+  const activeEmbeddedSubIndexRef = useRef<number | null>(null);
+  const subtitleUrlRef = useRef<string | null>(null);
+  const [detectedContainerSubtitles, setDetectedContainerSubtitles] = useState<SubtitleTrackOption[]>([]);
+  const [nativeTextTracks, setNativeTextTracks] = useState<SubtitleTrackOption[]>([]);
+  const [activeEmbeddedSubIndex, setActiveEmbeddedSubIndex] = useState<number | null>(null);
+  const [embeddedSubLoadingIndex, setEmbeddedSubLoadingIndex] = useState<number | null>(null);
+  const [embeddedSubStreaming, setEmbeddedSubStreaming] = useState(false);
+  const [embeddedSubVttText, setEmbeddedSubVttText] = useState<string | null>(null);
+  const [embeddedSubSynced, setEmbeddedSubSynced] = useState(false);
+  const [embeddedSubError, setEmbeddedSubError] = useState<string | null>(null);
+  const [showSubModal, setShowSubModal] = useState(false);
+
   // Audio Track Selection State (Native dual-audio + container inspection + MSE switcher + external audio fallback)
   const auxAudioRef = useRef<HTMLAudioElement | null>(null);
   const localVideoFileRef = useRef<File | null>(null);
@@ -211,18 +236,80 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     } catch (e) { }
   };
 
+  const destroySubController = useCallback(() => {
+    subSwitchIdRef.current += 1;
+    if (subControllerRef.current) {
+      subControllerRef.current.destroy();
+      subControllerRef.current = null;
+    }
+    if (activeNativeTextTrackRef.current) {
+      try {
+        activeNativeTextTrackRef.current.mode = 'disabled';
+      } catch { }
+      activeNativeTextTrackRef.current = null;
+    }
+    activeEmbeddedSubIndexRef.current = null;
+    setActiveEmbeddedSubIndex(null);
+    setEmbeddedSubLoadingIndex(null);
+    setEmbeddedSubStreaming(false);
+    setEmbeddedSubVttText(null);
+    setEmbeddedSubSynced(false);
+    setEmbeddedSubError(null);
+  }, []);
+
+  const syncActiveCueAt = useCallback((cues: SubtitleCue[], timeSec: number) => {
+    let nextCueText: string | null = null;
+    if (cues.length > 0) {
+      const lines: string[] = [];
+      for (let i = 0; i < cues.length; i++) {
+        const c = cues[i];
+        if (timeSec >= c.start && timeSec <= c.end && lines.indexOf(c.text) === -1) {
+          lines.push(c.text);
+        }
+      }
+      nextCueText = lines.length > 0 ? lines.join('\n') : null;
+    } else if (activeNativeTextTrackRef.current) {
+      const ac = activeNativeTextTrackRef.current.activeCues;
+      if (ac && ac.length > 0) {
+        const lines: string[] = [];
+        for (let i = 0; i < ac.length; i++) {
+          const txt = (ac[i] as unknown as { text?: string }).text;
+          if (txt && lines.indexOf(txt) === -1) {
+            lines.push(txt.trim());
+          }
+        }
+        nextCueText = lines.length > 0 ? lines.join('\n') : null;
+      }
+    }
+    setActiveCueText((prev) => (prev === nextCueText ? prev : nextCueText));
+  }, []);
+
+  const initialRoomSubFetchedForRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    subtitleUrlRef.current = subtitleUrl;
+  }, [subtitleUrl]);
+
   // Auto-load partner or room synced subtitles
   useEffect(() => {
     if (!syncedSubtitle || !syncedSubtitle.vttText) return;
 
     try {
+      destroySubController();
       const cues = parseVTT(syncedSubtitle.vttText);
       setSubCues(cues);
+
+      if (subtitleUrlRef.current && subtitleUrlRef.current.startsWith('blob:')) {
+        URL.revokeObjectURL(subtitleUrlRef.current);
+      }
 
       // Prefer real HTTP URL from server (essential for iOS Safari), fallback to Blob
       const url = syncedSubtitle.url || URL.createObjectURL(new Blob([syncedSubtitle.vttText], { type: 'text/vtt' }));
       setSubtitleUrl(url);
       setSubtitleName(syncedSubtitle.filename || 'synced_subtitles.vtt');
+      if (videoRef.current) {
+        syncActiveCueAt(cues, videoRef.current.currentTime || 0);
+      }
 
       if (syncedSubtitle.senderName && syncedSubtitle.senderName !== userName) {
         setSubtitleSyncNotice(`✨ Subtitles synced by ${syncedSubtitle.senderName}`);
@@ -231,42 +318,67 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     } catch (err) {
       console.error('Failed to parse synced subtitle:', err);
     }
-  }, [syncedSubtitle, userName]);
+  }, [syncedSubtitle, userName, destroySubController, syncActiveCueAt]);
 
-  // Initial fetch for existing room subtitles if partner joined after upload
+  // Initial catch-up fetch once per room if partner joined after subtitles were already uploaded
   useEffect(() => {
-    if (!roomCode || subtitleUrl) return;
+    const cleanRoom = (roomCode || '').trim().toLowerCase();
+    if (!cleanRoom) {
+      initialRoomSubFetchedForRef.current = null;
+      return;
+    }
+    if (initialRoomSubFetchedForRef.current === cleanRoom) return;
+    initialRoomSubFetchedForRef.current = cleanRoom;
 
-    fetch(`/api/room/subtitle?room=${encodeURIComponent(roomCode.trim().toLowerCase())}`)
+    if (subtitleUrlRef.current || activeEmbeddedSubIndexRef.current !== null) return;
+
+    let cancelled = false;
+    const roomApiUrl = `/api/room/subtitle?room=${encodeURIComponent(cleanRoom)}`;
+
+    fetch(roomApiUrl)
       .then((res) => {
         if (res.ok) return res.text();
         throw new Error('No room subtitles');
       })
       .then((vttText) => {
-        if (vttText) {
-          const cues = parseVTT(vttText);
-          setSubCues(cues);
-          setSubtitleUrl(`/api/room/subtitle?room=${encodeURIComponent(roomCode.trim().toLowerCase())}`);
-          setSubtitleName('Room Subtitles.vtt');
+        if (cancelled || !vttText) return;
+        // Never overwrite if the user already loaded uploaded or inbuilt subtitles while fetching
+        if (subtitleUrlRef.current || activeEmbeddedSubIndexRef.current !== null) return;
+        const cues = parseVTT(vttText);
+        setSubCues(cues);
+        setSubtitleUrl(roomApiUrl);
+        setSubtitleName('Room Subtitles.vtt');
+        if (videoRef.current) {
+          syncActiveCueAt(cues, videoRef.current.currentTime || 0);
         }
       })
       .catch(() => { });
-  }, [roomCode, subtitleUrl]);
 
-  // Keep native track in 'hidden' mode so browser does not draw duplicate captions behind custom overlay
+    return () => {
+      cancelled = true;
+    };
+  }, [roomCode, syncActiveCueAt]);
+
+  // Keep external track 'hidden' and unused native textTracks 'disabled' so browser never draws duplicate captions
   useEffect(() => {
-    if (videoRef.current && subtitleUrl) {
-      const video = videoRef.current;
-      const timer = setTimeout(() => {
-        if (video.textTracks && video.textTracks.length > 0) {
-          for (let i = 0; i < video.textTracks.length; i++) {
-            video.textTracks[i].mode = 'hidden';
-          }
+    const video = videoRef.current;
+    if (!video || !video.textTracks) return;
+    const timer = setTimeout(() => {
+      const extTrack = externalTrackElRef.current?.track || null;
+      const activeNative = activeNativeTextTrackRef.current;
+      for (let i = 0; i < video.textTracks.length; i++) {
+        const tt = video.textTracks[i];
+        if (extTrack && tt === extTrack) {
+          tt.mode = subtitleUrl ? 'hidden' : 'disabled';
+        } else if (activeNative && tt === activeNative) {
+          tt.mode = 'hidden';
+        } else {
+          tt.mode = 'disabled';
         }
-      }, 100);
-      return () => clearTimeout(timer);
-    }
-  }, [subtitleUrl]);
+      }
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [subtitleUrl, activeEmbeddedSubIndex, nativeTextTracks]);
 
   // Determine active video source (Local file -> Direct URL -> Server HTTP 206 Stream)
   const videoSrc = localFileUrl || (
@@ -299,13 +411,18 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     setMseErrorMsg(null);
   }, []);
 
-  const refreshNativeAudioTracks = useCallback(() => {
-    const result = extractNativeAudioTracks(videoRef.current);
+  const refreshNativeMediaTracks = useCallback(() => {
+    const video = videoRef.current;
+    const result = extractNativeAudioTracks(video);
     setAudioTracksSupported(result.supported);
     setAudioTracks(result.tracks);
     if (result.supported) {
       setSelectedAudioTrackIndex(result.selectedIndex);
     }
+
+    const nativeSubs = extractNativeTextTracks(video, externalTrackElRef.current?.track || null);
+    nativeTextTrackRefs.current = nativeSubs.nativeTrackRefs;
+    setNativeTextTracks(nativeSubs.tracks);
   }, []);
 
   const externalAudioUrlRef = useRef<string | null>(null);
@@ -318,13 +435,27 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     isMutedRef.current = isMuted;
   }, [volume, isMuted]);
 
-  // Reset & inspect audio tracks whenever videoSrc changes
+  // Reset & inspect audio and subtitle tracks whenever videoSrc changes
   useEffect(() => {
     setAudioTracks([]);
     setDetectedContainerTracks([]);
+    setDetectedContainerSubtitles([]);
+    setNativeTextTracks([]);
+    nativeTextTrackRefs.current = [];
     setSelectedAudioTrackIndex(0);
     setAudioTracksSupported(null);
     destroyMseController();
+
+    if (activeEmbeddedSubIndexRef.current !== null) {
+      if (subtitleUrlRef.current && subtitleUrlRef.current.startsWith('blob:')) {
+        URL.revokeObjectURL(subtitleUrlRef.current);
+      }
+      setSubtitleUrl(null);
+      setSubtitleName(null);
+      setSubCues([]);
+      setActiveCueText(null);
+    }
+    destroySubController();
 
     if (externalAudioUrlRef.current) {
       if (externalAudioUrlRef.current.startsWith('blob:')) {
@@ -339,10 +470,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
     let cancelled = false;
     const video = videoRef.current as VideoElementWithAudioTracks | null;
     const trackList = video?.audioTracks;
+    const textTrackList = video?.textTracks;
 
     const onTracksChanged = () => {
       if (!cancelled) {
-        refreshNativeAudioTracks();
+        refreshNativeMediaTracks();
       }
     };
 
@@ -351,22 +483,27 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       trackList.addEventListener('removetrack', onTracksChanged);
       trackList.addEventListener('change', onTracksChanged);
     }
+    if (textTrackList && typeof textTrackList.addEventListener === 'function') {
+      textTrackList.addEventListener('addtrack', onTracksChanged);
+      textTrackList.addEventListener('removetrack', onTracksChanged);
+      textTrackList.addEventListener('change', onTracksChanged);
+    }
 
-    // Also inspect local or same-origin stream container headers as a reliable detector
-    // when the browser hides video.audioTracks (e.g. default Chrome/Edge).
-    const applyDetectedTracks = (found: AudioTrackOption[]) => {
+    // Inspect local or same-origin stream container headers for both audio and embedded subtitles
+    const applyDetectedTracks = (found: MediaTracksInspectionResult) => {
       if (cancelled) return;
-      setDetectedContainerTracks(found);
-      if (found.length > 0 && mseActiveTrackIndexRef.current === null) {
-        const defIdx = Math.max(0, found.findIndex((t) => t.enabled));
+      setDetectedContainerTracks(found.audioTracks);
+      setDetectedContainerSubtitles(found.subtitleTracks);
+      if (found.audioTracks.length > 0 && mseActiveTrackIndexRef.current === null) {
+        const defIdx = Math.max(0, found.audioTracks.findIndex((t) => t.enabled));
         setSelectedAudioTrackIndex(defIdx);
       }
     };
 
     if (localFileUrl && videoSrc === localFileUrl && localVideoFileRef.current) {
-      inspectLocalVideoAudioTracks(localVideoFileRef.current).then(applyDetectedTracks);
+      inspectLocalVideoMediaTracks(localVideoFileRef.current).then(applyDetectedTracks);
     } else if (videoSrc.startsWith('/api/movies/stream/')) {
-      inspectStreamAudioTracks(videoSrc).then(applyDetectedTracks);
+      inspectStreamMediaTracks(videoSrc).then(applyDetectedTracks);
     }
 
     return () => {
@@ -376,8 +513,13 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
         trackList.removeEventListener('removetrack', onTracksChanged);
         trackList.removeEventListener('change', onTracksChanged);
       }
+      if (textTrackList && typeof textTrackList.removeEventListener === 'function') {
+        textTrackList.removeEventListener('addtrack', onTracksChanged);
+        textTrackList.removeEventListener('removetrack', onTracksChanged);
+        textTrackList.removeEventListener('change', onTracksChanged);
+      }
     };
-  }, [videoSrc, localFileUrl, refreshNativeAudioTracks, destroyMseController]);
+  }, [videoSrc, localFileUrl, refreshNativeMediaTracks, destroyMseController, destroySubController]);
 
   // Manage <audio> src imperatively for external audio so it never overwrites MediaSource blob URLs
   useEffect(() => {
@@ -414,11 +556,11 @@ export const VideoPlayer: React.FC<VideoPlayerProps> = ({
       clearTimeout(controlsTimeoutRef.current);
     }
     controlsTimeoutRef.current = setTimeout(() => {
-      if (isPlaying && !showSubStyleModal && !showAudioModal) {
+      if (isPlaying && !showSubStyleModal && !showAudioModal && !showSubModal) {
         setShowControls(false);
       }
     }, 3500);
-  }, [isPlaying, showSubStyleModal, showAudioModal]);
+  }, [isPlaying, showSubStyleModal, showAudioModal, showSubModal]);
 
 useEffect(() => {
   const handleFullscreenChange = () => {
@@ -433,6 +575,13 @@ useEffect(() => {
     if (mseControllerRef.current) {
       mseControllerRef.current.destroy();
       mseControllerRef.current = null;
+    }
+    if (subControllerRef.current) {
+      subControllerRef.current.destroy();
+      subControllerRef.current = null;
+    }
+    if (subtitleUrlRef.current && subtitleUrlRef.current.startsWith('blob:')) {
+      URL.revokeObjectURL(subtitleUrlRef.current);
     }
     if (externalAudioUrlRef.current && externalAudioUrlRef.current.startsWith('blob:')) {
       URL.revokeObjectURL(externalAudioUrlRef.current);
@@ -506,7 +655,7 @@ const handleSelectEmbeddedTrack = (trackIndex: number) => {
   }
 
   setSelectedAudioTrackIndex(trackIndex);
-  refreshNativeAudioTracks();
+  refreshNativeMediaTracks();
   const chosen = audioTracks.find((t) => t.index === trackIndex);
   showAudioToast(`Audio: ${chosen ? chosen.label : `Track ${trackIndex + 1}`}`);
 };
@@ -675,26 +824,182 @@ const handleRemoveExternalAudio = () => {
   showAudioToast('Switched back to video audio');
 };
 
+const handleTurnOffSubtitles = useCallback(() => {
+  destroySubController();
+  if (subtitleUrlRef.current && subtitleUrlRef.current.startsWith('blob:')) {
+    URL.revokeObjectURL(subtitleUrlRef.current);
+  }
+  setSubtitleUrl(null);
+  setSubtitleName(null);
+  setSubCues([]);
+  setActiveCueText(null);
+}, [destroySubController]);
+
+const handleSelectEmbeddedSubtitle = async (track: SubtitleTrackOption) => {
+  if (!track.textSupported) {
+    setEmbeddedSubError(
+      `${track.label} uses bitmap images (${track.codec || 'Bitmap'}), which browsers cannot render as overlay text. Choose a text track (SRT/ASS/WebVTT) or load an external .srt / .vtt file.`
+    );
+    return;
+  }
+
+  if (
+    activeEmbeddedSubIndexRef.current === track.index &&
+    !embeddedSubError &&
+    (subCues.length > 0 || activeNativeTextTrackRef.current !== null || embeddedSubStreaming)
+  ) {
+    return;
+  }
+
+  destroySubController();
+  const switchId = subSwitchIdRef.current;
+
+  if (subtitleUrlRef.current && subtitleUrlRef.current.startsWith('blob:')) {
+    URL.revokeObjectURL(subtitleUrlRef.current);
+  }
+  setSubtitleUrl(null);
+  setSubtitleName(null);
+  setSubCues([]);
+  setActiveCueText(null);
+  setEmbeddedSubLoadingIndex(track.index);
+  setEmbeddedSubError(null);
+
+  if (track.containerType && videoSrc) {
+    const localFile =
+      localFileUrl && videoSrc === localFileUrl ? localVideoFileRef.current : null;
+    const streamUrl =
+      videoSrc.startsWith('/api/movies/stream/') ? videoSrc : null;
+
+    try {
+      const res = await openEmbeddedSubtitleSource(
+        { file: localFile, url: streamUrl },
+        track.containerType,
+        track.index,
+        (updatedCues) => {
+          if (switchId !== subSwitchIdRef.current) return;
+          setSubCues(updatedCues);
+          syncActiveCueAt(updatedCues, videoRef.current?.currentTime || 0);
+        }
+      );
+
+      if (switchId !== subSwitchIdRef.current) {
+        if (res && res.mode === 'streaming') res.controller.destroy();
+        return;
+      }
+
+      if (res && res.mode === 'complete') {
+        const blobUrl = URL.createObjectURL(new Blob([res.vttText], { type: 'text/vtt' }));
+        activeEmbeddedSubIndexRef.current = track.index;
+        setActiveEmbeddedSubIndex(track.index);
+        setEmbeddedSubLoadingIndex(null);
+        setEmbeddedSubStreaming(false);
+        setEmbeddedSubVttText(res.vttText);
+        setSubCues(res.cues);
+        setSubtitleUrl(blobUrl);
+        setSubtitleName(track.label);
+        syncActiveCueAt(res.cues, videoRef.current?.currentTime || 0);
+        showAudioToast(`Subtitles: ${track.label} (${res.cues.length} lines)`);
+        return;
+      }
+
+      if (res && res.mode === 'streaming') {
+        subControllerRef.current = res.controller;
+        activeEmbeddedSubIndexRef.current = track.index;
+        setActiveEmbeddedSubIndex(track.index);
+        setEmbeddedSubStreaming(true);
+        setSubtitleName(track.label);
+
+        await res.controller.seekTo(videoRef.current?.currentTime || 0);
+        if (switchId !== subSwitchIdRef.current) return;
+
+        setEmbeddedSubLoadingIndex(null);
+        const initialCues = res.controller.getCues();
+        setSubCues(initialCues);
+        syncActiveCueAt(initialCues, videoRef.current?.currentTime || 0);
+        showAudioToast(`Subtitles: ${track.label}`);
+        return;
+      }
+    } catch (err) {
+      if (switchId !== subSwitchIdRef.current) return;
+      setEmbeddedSubLoadingIndex(null);
+      setEmbeddedSubError(
+        err instanceof Error ? err.message : `Failed to load "${track.label}" from video.`
+      );
+      return;
+    }
+  }
+
+  // Fallback for native browser TextTracks (e.g., Safari / HLS)
+  const nativeTrack = !track.containerType ? nativeTextTrackRefs.current[track.index] : undefined;
+  if (nativeTrack) {
+    activeNativeTextTrackRef.current = nativeTrack;
+    nativeTrack.mode = 'hidden';
+    const cuesFromNative: SubtitleCue[] = [];
+    if (nativeTrack.cues) {
+      for (let i = 0; i < nativeTrack.cues.length; i++) {
+        const nc = nativeTrack.cues[i] as unknown as { startTime: number; endTime: number; text?: string };
+        if (nc && nc.text) {
+          cuesFromNative.push({
+            start: nc.startTime,
+            end: nc.endTime,
+            text: nc.text.replace(/<[^>]+>/g, '').trim(),
+          });
+        }
+      }
+    }
+    activeEmbeddedSubIndexRef.current = track.index;
+    setActiveEmbeddedSubIndex(track.index);
+    setEmbeddedSubLoadingIndex(null);
+    setSubCues(cuesFromNative);
+    setSubtitleName(track.label);
+    syncActiveCueAt(cuesFromNative, videoRef.current?.currentTime || 0);
+    showAudioToast(`Subtitles: ${track.label}`);
+    return;
+  }
+
+  setEmbeddedSubLoadingIndex(null);
+  setEmbeddedSubError(
+    `Could not extract "${track.label}" from the video. Try loading an external .srt or .vtt file.`
+  );
+};
+
+const handleSyncExtractedToPartner = () => {
+  if (!embeddedSubVttText || !onSendSubtitle) return;
+  const filename = `${(subtitleName || 'embedded_subtitles').replace(/[\\/:*?"<>|]/g, '_')}.vtt`;
+  onSendSubtitle(embeddedSubVttText, filename);
+  setEmbeddedSubSynced(true);
+  showAudioToast('Subtitles synced with partner!');
+};
+
 // Handle Subtitle file upload (.vtt or .srt) & broadcast to partner
 const handleSubtitleSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
   const file = e.target.files?.[0];
+  e.target.value = '';
   if (!file) return;
 
   const reader = new FileReader();
   reader.onload = () => {
+    destroySubController();
     let text = reader.result as string;
     let vttText = text;
-    if (!file.name.endsWith('.vtt')) {
+    if (!file.name.toLowerCase().endsWith('.vtt')) {
       // Standard SRT to VTT converter in-browser
       vttText = 'WEBVTT\n\n' + text.replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, '$1.$2');
     }
     const cues = parseVTT(vttText);
     setSubCues(cues);
 
+    if (subtitleUrlRef.current && subtitleUrlRef.current.startsWith('blob:')) {
+      URL.revokeObjectURL(subtitleUrlRef.current);
+    }
     const blob = new Blob([vttText], { type: 'text/vtt' });
     const url = URL.createObjectURL(blob);
     setSubtitleUrl(url);
     setSubtitleName(file.name);
+    if (videoRef.current) {
+      syncActiveCueAt(cues, videoRef.current.currentTime || 0);
+    }
+    showAudioToast(`Subtitles: ${file.name}`);
 
     // Broadcast subtitle directly to partner so she doesn't need to do anything!
     if (onSendSubtitle) {
@@ -822,11 +1127,10 @@ const onTimeUpdate = () => {
   if (videoRef.current) {
     const time = videoRef.current.currentTime;
     setCurrentTime(time);
-    if (subCues.length > 0) {
-      const cue = subCues.find((c) => time >= c.start && time <= c.end);
-      setActiveCueText(cue ? cue.text : null);
-    } else if (activeCueText) {
-      setActiveCueText(null);
+    syncActiveCueAt(subCues, time);
+
+    if (subControllerRef.current && activeEmbeddedSubIndexRef.current !== null) {
+      subControllerRef.current.ensureBufferedAt(time);
     }
 
     // Keep external or MSE audio locked in sync with video
@@ -854,7 +1158,7 @@ const onLoadedMetadata = () => {
     setDuration(videoRef.current.duration);
     videoRef.current.volume = volume;
     videoRef.current.muted = hasAuxAudio ? true : isMuted;
-    refreshNativeAudioTracks();
+    refreshNativeMediaTracks();
   }
 };
 
@@ -862,11 +1166,21 @@ const onSeekedHandler = () => {
   const video = videoRef.current;
   const auxAudio = auxAudioRef.current;
   if (!video) return;
+  syncActiveCueAt(subCues, video.currentTime);
   const mseActive = mseActiveTrackIndexRef.current !== null;
   if (mseControllerRef.current && mseActive) {
     mseControllerRef.current.seekTo(video.currentTime);
   } else if (auxAudio && externalAudioUrl) {
     auxAudio.currentTime = video.currentTime;
+  }
+  if (subControllerRef.current && activeEmbeddedSubIndexRef.current !== null) {
+    const subCtrl = subControllerRef.current;
+    const seekSec = video.currentTime;
+    subCtrl.seekTo(seekSec).then(() => {
+      if (subControllerRef.current === subCtrl) {
+        syncActiveCueAt(subCtrl.getCues(), videoRef.current?.currentTime ?? seekSec);
+      }
+    });
   }
 };
 
@@ -961,6 +1275,24 @@ const activeAudioBadgeText = externalAudioUrl
       ? String(effectiveEmbeddedTracks.length)
       : null;
 
+const effectiveSubtitleTracks =
+  detectedContainerSubtitles.length > 0 ? detectedContainerSubtitles : nativeTextTracks;
+const hasEmbeddedSubtitles = effectiveSubtitleTracks.length > 0;
+const hasAnySubtitleActive = activeEmbeddedSubIndex !== null || Boolean(subtitleUrl);
+const activeSubTrack =
+  activeEmbeddedSubIndex !== null
+    ? effectiveSubtitleTracks.find((t) => t.index === activeEmbeddedSubIndex) || null
+    : null;
+const activeSubBadgeText = activeSubTrack?.languageCode
+  ? activeSubTrack.languageCode.slice(0, 2).toUpperCase()
+  : activeEmbeddedSubIndex !== null
+    ? 'CC'
+    : subtitleUrl
+      ? 'EXT'
+      : hasEmbeddedSubtitles
+        ? String(effectiveSubtitleTracks.length)
+        : null;
+
 return (
   <div className="flex flex-col gap-2">
     {/* Video Container */}
@@ -970,7 +1302,7 @@ return (
       onMouseMove={handleUserActivity}
       onTouchStart={handleUserActivity}
       onClick={handleUserActivity}
-      onMouseLeave={() => { if (isPlaying && !showSubStyleModal && !showAudioModal) setShowControls(false); }}
+      onMouseLeave={() => { if (isPlaying && !showSubStyleModal && !showAudioModal && !showSubModal) setShowControls(false); }}
     >
       {videoSrc ? (
         <video
@@ -978,8 +1310,8 @@ return (
           src={videoSrc}
           onTimeUpdate={onTimeUpdate}
           onLoadedMetadata={onLoadedMetadata}
-          onLoadedData={refreshNativeAudioTracks}
-          onCanPlay={refreshNativeAudioTracks}
+          onLoadedData={refreshNativeMediaTracks}
+          onCanPlay={refreshNativeMediaTracks}
           onSeeked={onSeekedHandler}
           onPlay={onPlayHandler}
           onPause={onPauseHandler}
@@ -990,7 +1322,15 @@ return (
           onClick={togglePlay}
         >
           {subtitleUrl && (
-            <track key={subtitleUrl} src={subtitleUrl} kind="subtitles" srcLang="en" label="English" default />
+            <track
+              ref={externalTrackElRef}
+              key={subtitleUrl}
+              src={subtitleUrl}
+              kind="subtitles"
+              srcLang="en"
+              label="English"
+              default
+            />
           )}
         </video>
       ) : (
@@ -1594,6 +1934,249 @@ return (
         </div>
       )}
 
+      {/* Subtitle Selector Modal */}
+      {showSubModal && (
+        <div
+          className="absolute inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4"
+          onClick={() => setShowSubModal(false)}
+        >
+          <div
+            className="w-full max-w-md bg-neutral-900 border border-neutral-800 rounded-2xl shadow-2xl p-5 flex flex-col gap-4 text-sm text-neutral-200 max-h-[85vh] overflow-y-auto"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between border-b border-neutral-800 pb-3">
+              <div className="flex items-center gap-2.5">
+                <Subtitles className="w-5 h-5 text-blue-400" />
+                <div>
+                  <h3 className="font-semibold text-base text-white">Subtitles</h3>
+                  <p className="text-[11px] text-neutral-400">Choose inbuilt video subtitles or upload .srt / .vtt</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowSubModal(false)}
+                className="p-1.5 rounded-lg text-neutral-400 hover:text-white hover:bg-neutral-800 transition-colors"
+                title="Close"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Embedded Video Subtitle Tracks */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between">
+                <span className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400">
+                  Embedded Video Subtitles
+                </span>
+                {effectiveSubtitleTracks.length > 0 && (
+                  <span className="text-[11px] font-medium text-blue-300">
+                    {effectiveSubtitleTracks.length} {effectiveSubtitleTracks.length === 1 ? 'track' : 'tracks'} found
+                  </span>
+                )}
+              </div>
+
+              {/* Off Row */}
+              <button
+                onClick={() => handleTurnOffSubtitles()}
+                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl border text-left transition-all ${!hasAnySubtitleActive
+                  ? 'bg-blue-950/50 border-blue-500/60 text-white'
+                  : 'bg-neutral-800/60 hover:bg-neutral-800 border-neutral-700/70 text-neutral-300'
+                  }`}
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <span className="w-6 h-6 rounded-full bg-neutral-800 border border-neutral-700 flex items-center justify-center text-[11px] font-semibold text-neutral-400 shrink-0">
+                    0
+                  </span>
+                  <span className="font-medium truncate">Off (No Subtitles)</span>
+                </div>
+                {!hasAnySubtitleActive && <Check className="w-4 h-4 text-blue-400 shrink-0" />}
+              </button>
+
+              {effectiveSubtitleTracks.length > 0 ? (
+                <div className="space-y-1.5">
+                  {effectiveSubtitleTracks.map((track) => {
+                    const isActive = activeEmbeddedSubIndex === track.index;
+                    const isLoading = embeddedSubLoadingIndex === track.index;
+                    const isDisabled = !track.textSupported;
+
+                    return (
+                      <button
+                        key={track.id}
+                        onClick={() => !isDisabled && handleSelectEmbeddedSubtitle(track)}
+                        disabled={isDisabled}
+                        className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl border text-left transition-all ${isDisabled
+                          ? 'bg-neutral-900/60 border-neutral-800 text-neutral-500 cursor-not-allowed opacity-70'
+                          : isActive
+                            ? 'bg-blue-950/60 border-blue-500/60 text-white shadow-sm'
+                            : 'bg-neutral-800/60 hover:bg-neutral-800 border-neutral-700/70 text-neutral-200'
+                          }`}
+                      >
+                        <div className="flex items-center gap-2.5 min-w-0 pr-2">
+                          <span className={`w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-bold shrink-0 ${isActive
+                            ? 'bg-blue-500/30 text-blue-200 border border-blue-400/40'
+                            : 'bg-neutral-800 text-neutral-400 border border-neutral-700'
+                            }`}>
+                            {track.index + 1}
+                          </span>
+                          <div className="min-w-0">
+                            <div className="font-medium truncate flex items-center gap-1.5">
+                              <span className="truncate">{track.label}</span>
+                              {track.forced && (
+                                <span className="text-[10px] px-1.5 py-0.2 rounded bg-amber-950/70 text-amber-300 border border-amber-500/30 shrink-0">
+                                  Forced
+                                </span>
+                              )}
+                            </div>
+                            <div className="text-[11px] text-neutral-400 truncate">
+                              {isDisabled
+                                ? 'Bitmap / Image subtitle (not text-readable)'
+                                : isLoading
+                                  ? 'Reading subtitles from video...'
+                                  : track.codec
+                                    ? `${track.codec} track`
+                                    : track.language}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {isLoading ? (
+                            <RefreshCw className="w-4 h-4 text-blue-400 animate-spin" />
+                          ) : isActive ? (
+                            <span className="flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-blue-500/20 text-blue-300 border border-blue-400/30">
+                              <Check className="w-3 h-3" />
+                              Active
+                            </span>
+                          ) : track.isDefault ? (
+                            <span className="text-[10px] px-2 py-0.5 rounded bg-neutral-800 text-neutral-400 border border-neutral-700">
+                              Default
+                            </span>
+                          ) : null}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="rounded-xl bg-neutral-800/40 border border-neutral-800 px-3 py-2.5 text-xs text-neutral-400 flex items-start gap-2">
+                  <Info className="w-4 h-4 text-neutral-400 shrink-0 mt-0.5" />
+                  <span>
+                    {videoSrc
+                      ? 'No embedded subtitle tracks were found in this video file. You can upload an external .srt or .vtt file below.'
+                      : 'Load or select a video to scan for inbuilt subtitle tracks.'}
+                  </span>
+                </div>
+              )}
+
+              {embeddedSubError && (
+                <div className="rounded-xl bg-rose-950/40 border border-rose-500/40 px-3 py-2.5 text-xs text-rose-300 flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <span>{embeddedSubError}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Active Subtitle Status & Actions */}
+            {hasAnySubtitleActive && (
+              <div className="rounded-xl bg-blue-950/35 border border-blue-500/35 p-3 space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-[11px] uppercase tracking-wider font-semibold text-blue-300">
+                      {activeEmbeddedSubIndex !== null ? 'Inbuilt Subtitle Active' : 'External Subtitle Active'}
+                    </div>
+                    <div className="text-xs font-medium text-white truncate">
+                      {subtitleName || activeSubBadgeText || 'Subtitles Active'}
+                    </div>
+                    {activeEmbeddedSubIndex !== null && (
+                      <div className="text-[11px] text-neutral-400 mt-0.5">
+                        {embeddedSubStreaming
+                          ? `${subCues.length} cues buffered around playback position`
+                          : `${subCues.length} cues loaded`}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {subtitleUrl && (
+                    <a
+                      href={subtitleUrl}
+                      download={subtitleName || 'subtitles.vtt'}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-xs text-blue-200 border border-neutral-700 transition-colors"
+                    >
+                      <Download className="w-3.5 h-3.5 text-blue-400" />
+                      Download .vtt
+                    </a>
+                  )}
+
+                  {activeEmbeddedSubIndex !== null && embeddedSubVttText && onSendSubtitle && (
+                    <button
+                      onClick={() => handleSyncExtractedToPartner()}
+                      disabled={embeddedSubSynced}
+                      className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs border transition-colors ${embeddedSubSynced
+                        ? 'bg-emerald-950/50 border-emerald-500/40 text-emerald-300 cursor-default'
+                        : 'bg-blue-600/80 hover:bg-blue-600 border-blue-400/40 text-white'
+                        }`}
+                    >
+                      {embeddedSubSynced ? <Check className="w-3.5 h-3.5" /> : <Upload className="w-3.5 h-3.5" />}
+                      {embeddedSubSynced ? 'Synced to Partner' : 'Sync to Partner'}
+                    </button>
+                  )}
+
+                  <button
+                    onClick={() => {
+                      setShowSubModal(false);
+                      setShowSubStyleModal(true);
+                    }}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-xs text-neutral-200 border border-neutral-700 transition-colors"
+                  >
+                    <Sliders className="w-3.5 h-3.5 text-rose-300" />
+                    Style
+                  </button>
+
+                  <button
+                    onClick={() => handleTurnOffSubtitles()}
+                    className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-neutral-800 hover:bg-rose-950/70 text-xs text-neutral-300 hover:text-rose-200 border border-neutral-700 hover:border-rose-500/40 transition-colors ml-auto"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                    Off
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* External Subtitle Upload */}
+            <div className="space-y-2 pt-1 border-t border-neutral-800">
+              <span className="text-[11px] font-semibold uppercase tracking-wider text-neutral-400 block">
+                External Subtitle File (Syncs to Partner)
+              </span>
+              <label className="w-full flex items-center justify-center gap-2 px-3 py-2.5 rounded-xl bg-neutral-800/80 hover:bg-neutral-800 border border-neutral-700 hover:border-blue-500/50 text-neutral-200 cursor-pointer transition-all text-xs font-medium">
+                <Upload className="w-4 h-4 text-blue-400" />
+                <span>Upload External Subtitle (.srt, .vtt)</span>
+                <input
+                  type="file"
+                  accept=".srt,.vtt"
+                  onChange={handleSubtitleSelect}
+                  className="hidden"
+                />
+              </label>
+            </div>
+
+            {/* Footer */}
+            <div className="flex justify-end pt-2 border-t border-neutral-800">
+              <button
+                onClick={() => setShowSubModal(false)}
+                className="px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-medium rounded-lg shadow-md transition-colors text-xs"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Subtitle-like Chat Popup */}
       {latestPopupMsg && !showChatOverlay && (
         <div className="absolute top-6 left-6 flex justify-start pointer-events-none z-30">
@@ -1662,6 +2245,7 @@ return (
                 onClick={(e) => {
                   e.stopPropagation();
                   setShowAudioModal(false);
+                  setShowSubModal(false);
                   setShowSubStyleModal((prev) => !prev);
                 }}
                 className={`px-3 py-1.5 rounded-full backdrop-blur-md flex items-center gap-1.5 text-xs sm:text-sm font-medium transition-colors ${showSubStyleModal
@@ -1678,6 +2262,7 @@ return (
                 onClick={(e) => {
                   e.stopPropagation();
                   setShowSubStyleModal(false);
+                  setShowSubModal(false);
                   setShowAudioModal((prev) => !prev);
                 }}
                 className={`px-3 py-1.5 rounded-full backdrop-blur-md flex items-center gap-1.5 text-xs sm:text-sm font-medium transition-colors ${showAudioModal
@@ -1693,6 +2278,30 @@ return (
                 {activeAudioBadgeText && (
                   <span className="text-[10px] font-bold px-1.5 py-0.2 rounded-full bg-amber-500/30 text-amber-200 border border-amber-400/30">
                     {activeAudioBadgeText}
+                  </span>
+                )}
+              </button>
+
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setShowSubStyleModal(false);
+                  setShowAudioModal(false);
+                  setShowSubModal((prev) => !prev);
+                }}
+                className={`px-3 py-1.5 rounded-full backdrop-blur-md flex items-center gap-1.5 text-xs sm:text-sm font-medium transition-colors ${showSubModal
+                  ? 'bg-blue-600 text-white shadow-lg shadow-blue-900/50'
+                  : hasAnySubtitleActive || hasEmbeddedSubtitles
+                    ? 'bg-blue-950/80 hover:bg-blue-800/80 text-blue-200 border border-blue-500/40'
+                    : 'bg-black/50 hover:bg-neutral-700 text-white'
+                  }`}
+                title="Choose Subtitles (Inbuilt Video Subtitles or External .srt / .vtt)"
+              >
+                <Subtitles className="w-3.5 h-3.5 text-blue-300" />
+                <span className="hidden sm:inline">Sub</span>
+                {activeSubBadgeText && (
+                  <span className="text-[10px] font-bold px-1.5 py-0.2 rounded-full bg-blue-500/30 text-blue-200 border border-blue-400/30 max-w-[80px] truncate">
+                    {activeSubBadgeText}
                   </span>
                 )}
               </button>
@@ -1833,49 +2442,65 @@ return (
           </label>
 
           {/* Subtitle Selector / Status & Download */}
-          {subtitleUrl ? (
-            <div className="flex items-center gap-1.5 bg-blue-950/60 border border-blue-500/40 rounded-lg px-2 py-1 text-blue-300 text-xs shadow-sm">
-              <Subtitles className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-              <span className="max-w-[60px] sm:max-w-[120px] truncate text-[11px] font-semibold text-blue-200" title={subtitleName || 'Subtitles active'}>
-                {subtitleName || 'CC On'}
-              </span>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => {
+                setShowAudioModal(false);
+                setShowSubStyleModal(false);
+                setShowSubModal((prev) => !prev);
+              }}
+              className={`flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 rounded-lg transition-all border ${showSubModal
+                ? 'bg-blue-600 text-white border-blue-500 shadow-md shadow-blue-950'
+                : hasAnySubtitleActive || hasEmbeddedSubtitles
+                  ? 'bg-blue-950/60 hover:bg-blue-900/60 border-blue-500/40 text-blue-200'
+                  : 'bg-neutral-800 hover:bg-neutral-700 border-neutral-700 text-neutral-300'
+                }`}
+              title={
+                hasEmbeddedSubtitles
+                  ? `Subtitles (${effectiveSubtitleTracks.length} inbuilt track${effectiveSubtitleTracks.length === 1 ? '' : 's'} detected, or upload .srt/.vtt)`
+                  : 'Subtitles (Inbuilt tracks or upload .srt/.vtt)'
+              }
+            >
+              <Subtitles className={`w-3.5 h-3.5 shrink-0 ${showSubModal ? 'text-white' : 'text-blue-400'}`} />
+              <span className="hidden sm:inline text-[11px] font-medium">Sub</span>
+              {activeSubBadgeText && (
+                <span className="text-[10px] font-bold px-1 py-0.2 rounded bg-blue-500/25 text-blue-200 border border-blue-400/30 max-w-[75px] truncate">
+                  {activeSubBadgeText}
+                </span>
+              )}
+            </button>
+
+            {subtitleUrl && (
               <a
                 href={subtitleUrl}
                 download={subtitleName || 'subtitles.vtt'}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="p-1 hover:text-white transition-colors"
+                className="p-1.5 bg-blue-950/50 hover:bg-blue-900/70 border border-blue-500/30 rounded-lg text-blue-300 hover:text-white transition-colors"
                 title="Download subtitle file (.vtt)"
               >
-                <Download className="w-3.5 h-3.5 text-blue-400 hover:text-blue-100" />
+                <Download className="w-3.5 h-3.5" />
               </a>
+            )}
+
+            {hasAnySubtitleActive && (
               <button
-                onClick={(e) => { e.stopPropagation(); setSubtitleUrl(null); setSubtitleName(null); setSubCues([]); setActiveCueText(null); }}
-                className="p-1 hover:text-rose-400 transition-colors"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleTurnOffSubtitles();
+                }}
+                className="p-1.5 bg-neutral-800 hover:bg-rose-950/70 border border-neutral-700 hover:border-rose-500/40 rounded-lg text-neutral-400 hover:text-rose-300 transition-colors"
                 title="Turn off subtitles"
               >
-                <X className="w-3.5 h-3.5 text-neutral-400 hover:text-rose-400" />
+                <X className="w-3.5 h-3.5" />
               </button>
-            </div>
-          ) : (
-            <label
-              className="flex items-center gap-1.5 px-2 sm:px-2.5 py-1.5 bg-neutral-800 hover:bg-neutral-700 active:scale-95 text-neutral-300 rounded-lg cursor-pointer transition-all border border-neutral-700"
-              title="Add Subtitle (.srt or .vtt) - Automatically syncs to partner!"
-            >
-              <Subtitles className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-              <span className="text-[11px] font-medium">Sub</span>
-              <input
-                type="file"
-                accept=".srt,.vtt"
-                onChange={handleSubtitleSelect}
-                className="hidden"
-              />
-            </label>
-          )}
+            )}
+          </div>
 
           {/* Audio Track Selector Button */}
           <button
             onClick={() => {
+              setShowSubModal(false);
               setShowSubStyleModal(false);
               setShowAudioModal((prev) => !prev);
             }}
@@ -1904,6 +2529,7 @@ return (
           {/* Subtitle Style Settings Button */}
           <button
             onClick={() => {
+              setShowSubModal(false);
               setShowAudioModal(false);
               setShowSubStyleModal((prev) => !prev);
             }}

@@ -425,20 +425,21 @@ export interface AudioTrackSource {
   readBatchAt(startTimeSec: number, minDurationSec: number): Promise<ExtractedAudioBatch | null>;
 }
 
-interface Mp4SampleTable {
+export interface Mp4SampleTable {
   offsets: Float64Array;
   sizes: Uint32Array;
   dts: Float64Array;
   durations: Uint32Array;
 }
 
-function buildMp4SampleTable(
+export function buildMp4SampleTable(
   sttsBytes: Uint8Array | null,
   stscBytes: Uint8Array | null,
   stszBytes: Uint8Array | null,
   stcoBytes: Uint8Array | null,
   isCo64: boolean,
-  initialDtsTicks: number
+  initialDtsTicks: number,
+  defaultDelta = 1024
 ): Mp4SampleTable | null {
   if (!sttsBytes || !stscBytes || !stszBytes || !stcoBytes) return null;
 
@@ -468,17 +469,18 @@ function buildMp4SampleTable(
   for (let e = 0; e < tsEntries && 8 + e * 8 + 8 <= sttsBytes.length; e++) {
     const count = tsView.getUint32(8 + e * 8, false);
     const delta = tsView.getUint32(12 + e * 8, false);
+    const effectiveDelta = delta || defaultDelta;
     for (let k = 0; k < count && sIdx < sampleCount; k++) {
       dts[sIdx] = runningDts;
-      durations[sIdx] = delta || 1024;
-      runningDts += delta || 1024;
+      durations[sIdx] = effectiveDelta;
+      runningDts += effectiveDelta;
       sIdx++;
     }
   }
   while (sIdx < sampleCount) {
     dts[sIdx] = runningDts;
-    durations[sIdx] = 1024;
-    runningDts += 1024;
+    durations[sIdx] = defaultDelta;
+    runningDts += defaultDelta;
     sIdx++;
   }
 
@@ -525,7 +527,7 @@ function buildMp4SampleTable(
   return { offsets, sizes, dts, durations };
 }
 
-function binarySearchDts(dts: Float64Array, targetTicks: number): number {
+export function binarySearchDts(dts: Float64Array, targetTicks: number): number {
   let lo = 0;
   let hi = dts.length - 1;
   let best = 0;
@@ -541,12 +543,8 @@ function binarySearchDts(dts: Float64Array, targetTicks: number): number {
   return best;
 }
 
-async function openMp4AudioSource(
-  reader: ByteReader,
-  audioTrackIndex: number
-): Promise<AudioTrackSource | null> {
+export async function readMp4MoovBox(reader: ByteReader): Promise<Uint8Array | null> {
   let offset = 0;
-  let moovBytes: Uint8Array | null = null;
   let iterations = 0;
 
   while (offset + 8 <= reader.size && iterations < 64) {
@@ -569,12 +567,19 @@ async function openMp4AudioSource(
     if (type === 'moov') {
       const payloadSize = boxSize - headerSize;
       if (payloadSize <= 0 || payloadSize > 64 * 1024 * 1024) return null;
-      moovBytes = await reader.read(offset + headerSize, payloadSize);
-      break;
+      return reader.read(offset + headerSize, payloadSize);
     }
     offset += boxSize;
   }
 
+  return null;
+}
+
+async function openMp4AudioSource(
+  reader: ByteReader,
+  audioTrackIndex: number
+): Promise<AudioTrackSource | null> {
+  const moovBytes = await readMp4MoovBox(reader);
   if (!moovBytes) return null;
 
   let mvhdTimescale = 1000;
@@ -794,7 +799,7 @@ function buildOpusSampleEntry(channels: number, opusHead: Uint8Array): Uint8Arra
   return buildAudioSampleEntry('Opus', channels, 48000, [dOps]);
 }
 
-function unpackMkvBlockFrames(
+export function unpackMkvBlockFrames(
   bytes: Uint8Array,
   start: number,
   end: number,
@@ -875,15 +880,32 @@ function unpackMkvBlockFrames(
   return { relTimeMs, frames };
 }
 
-interface MkvClusterRef {
+export interface MkvClusterRef {
   timeSec: number;
   absOffset: number;
 }
 
-async function openMkvAudioSource(
-  reader: ByteReader,
-  audioTrackIndex: number
-): Promise<AudioTrackSource | null> {
+export interface MkvClusterHeader {
+  dataStart: number;
+  endOffset: number;
+  timeSec: number;
+}
+
+export interface MkvContainerContext {
+  segmentDataStart: number;
+  segmentEnd: number;
+  timestampScaleNs: number;
+  tracksBuf: Uint8Array;
+  cuesBuf: Uint8Array | null;
+  clusterRefs: MkvClusterRef[];
+  firstClusterAbsOffset: number | null;
+  readClusterHeader: (absOffset: number) => Promise<MkvClusterHeader | null>;
+  findClusterStartOffset: (targetTimeSec: number) => Promise<number | null>;
+}
+
+export async function openMkvContainerContext(
+  reader: ByteReader
+): Promise<MkvContainerContext | null> {
   const initialLen = Math.min(reader.size, 2 * 1024 * 1024);
   const headBuf = await reader.read(0, initialLen);
   if (headBuf.length < 16) return null;
@@ -994,7 +1016,11 @@ async function openMkvAudioSource(
     pos = cEnd;
   }
 
-  const readSeekedElement = async (relOffset: number, expectedId: number, maxLen: number): Promise<Uint8Array | null> => {
+  const readSeekedElement = async (
+    relOffset: number,
+    expectedId: number,
+    maxLen: number
+  ): Promise<Uint8Array | null> => {
     const abs = segmentDataStart + relOffset;
     if (abs + 16 >= reader.size) return null;
     const probe = await reader.read(abs, Math.min(64 * 1024, reader.size - abs));
@@ -1016,6 +1042,153 @@ async function openMkvAudioSource(
   if (!cuesBuf && cuesSeekRel !== null) {
     cuesBuf = await readSeekedElement(cuesSeekRel, 0x1c53bb6b, 8 * 1024 * 1024);
   }
+
+  const tickToSec = timestampScaleNs / 1000000000;
+  const clusterRefs: MkvClusterRef[] = [];
+  if (cuesBuf) {
+    const seenOffsets = new Set<number>();
+    let cp = 0;
+    while (cp < cuesBuf.length) {
+      const ci = readEbmlId(cuesBuf, cp, cuesBuf.length);
+      if (!ci) break;
+      const csz = readEbmlSize(cuesBuf, ci.nextPos, cuesBuf.length);
+      if (!csz || csz.size < 0) break;
+      const eStart = csz.nextPos;
+      const eEnd = Math.min(cuesBuf.length, eStart + csz.size);
+      if (ci.id === 0xbb) {
+        let cueTimeTicks = -1;
+        let clusterRelPos = -1;
+        let fp = eStart;
+        while (fp < eEnd) {
+          const fi = readEbmlId(cuesBuf, fp, eEnd);
+          if (!fi) break;
+          const fs = readEbmlSize(cuesBuf, fi.nextPos, eEnd);
+          if (!fs || fs.size < 0) break;
+          const vs = fs.nextPos;
+          const ve = Math.min(eEnd, vs + fs.size);
+          if (fi.id === 0xb3) {
+            cueTimeTicks = readEbmlUint(cuesBuf, vs, ve - vs);
+          } else if (fi.id === 0xb7) {
+            let pp = vs;
+            while (pp < ve) {
+              const pi = readEbmlId(cuesBuf, pp, ve);
+              if (!pi) break;
+              const psz = readEbmlSize(cuesBuf, pi.nextPos, ve);
+              if (!psz || psz.size < 0) break;
+              const pvs = psz.nextPos;
+              const pve = Math.min(ve, pvs + psz.size);
+              if (pi.id === 0xf1 && clusterRelPos === -1) {
+                clusterRelPos = readEbmlUint(cuesBuf, pvs, pve - pvs);
+              }
+              pp = pve;
+            }
+          }
+          fp = ve;
+        }
+        if (cueTimeTicks >= 0 && clusterRelPos >= 0) {
+          const absOff = segmentDataStart + clusterRelPos;
+          if (!seenOffsets.has(absOff)) {
+            seenOffsets.add(absOff);
+            clusterRefs.push({ timeSec: cueTimeTicks * tickToSec, absOffset: absOff });
+          }
+        }
+      }
+      cp = eEnd;
+    }
+    clusterRefs.sort((a, b) => a.timeSec - b.timeSec);
+  }
+
+  const readClusterHeader = async (absOffset: number): Promise<MkvClusterHeader | null> => {
+    if (absOffset + 8 >= segmentEnd) return null;
+    const probe = await reader.read(absOffset, Math.min(64, segmentEnd - absOffset));
+    const cid = readEbmlId(probe, 0, probe.length);
+    if (!cid || cid.id !== 0x1f43b675) return null;
+    const csz = readEbmlSize(probe, cid.nextPos, probe.length);
+    if (!csz) return null;
+    const dataStart = absOffset + csz.nextPos;
+    const endOffset = csz.size >= 0 ? Math.min(segmentEnd, dataStart + csz.size) : segmentEnd;
+
+    let timeSec = 0;
+    const ti = readEbmlId(probe, csz.nextPos, probe.length);
+    if (ti && ti.id === 0xe7) {
+      const tsz = readEbmlSize(probe, ti.nextPos, probe.length);
+      if (tsz && tsz.size >= 0 && tsz.nextPos + tsz.size <= probe.length) {
+        timeSec = readEbmlUint(probe, tsz.nextPos, tsz.size) * tickToSec;
+      }
+    }
+    return { dataStart, endOffset, timeSec };
+  };
+
+  if (firstClusterAbsOffset === null) {
+    let scanPos = segmentDataStart;
+    let guard = 0;
+    while (scanPos + 12 < segmentEnd && guard < 256) {
+      guard++;
+      const p = await reader.read(scanPos, Math.min(32, segmentEnd - scanPos));
+      const eid = readEbmlId(p, 0, p.length);
+      if (!eid) break;
+      const esz = readEbmlSize(p, eid.nextPos, p.length);
+      if (!esz) break;
+      if (eid.id === 0x1f43b675) {
+        firstClusterAbsOffset = scanPos;
+        break;
+      }
+      if (esz.size < 0) break;
+      scanPos += esz.nextPos + esz.size;
+    }
+  }
+
+  const findClusterStartOffset = async (targetTimeSec: number): Promise<number | null> => {
+    if (clusterRefs.length > 0) {
+      let best = clusterRefs[0].absOffset;
+      for (let i = 0; i < clusterRefs.length; i++) {
+        if (clusterRefs[i].timeSec <= targetTimeSec) {
+          best = clusterRefs[i].absOffset;
+        } else {
+          break;
+        }
+      }
+      return best;
+    }
+    if (firstClusterAbsOffset === null) return null;
+
+    let cur = firstClusterAbsOffset;
+    let best = firstClusterAbsOffset;
+    let guard = 0;
+    while (cur < segmentEnd && guard < 10000) {
+      guard++;
+      const hdr = await readClusterHeader(cur);
+      if (!hdr || hdr.endOffset <= cur) break;
+      if (hdr.timeSec <= targetTimeSec) {
+        best = cur;
+        cur = hdr.endOffset;
+      } else {
+        break;
+      }
+    }
+    return best;
+  };
+
+  return {
+    segmentDataStart,
+    segmentEnd,
+    timestampScaleNs,
+    tracksBuf,
+    cuesBuf,
+    clusterRefs,
+    firstClusterAbsOffset,
+    readClusterHeader,
+    findClusterStartOffset,
+  };
+}
+
+async function openMkvAudioSource(
+  reader: ByteReader,
+  audioTrackIndex: number
+): Promise<AudioTrackSource | null> {
+  const ctx = await openMkvContainerContext(reader);
+  if (!ctx) return null;
+  const { segmentEnd, timestampScaleNs, tracksBuf, readClusterHeader, findClusterStartOffset } = ctx;
 
   // Extract target audio track entry details
   let currentAudioIdx = -1;
@@ -1134,135 +1307,6 @@ async function openMkvAudioSource(
 
   const initSegment = buildFmp4InitSegment(sampleEntry, audioTimescale);
   const codecDelayMs = codecDelayNs / 1000000;
-  const tickToSec = timestampScaleNs / 1000000000;
-
-  // Parse Cues into sorted cluster reference list
-  const clusterRefs: MkvClusterRef[] = [];
-  if (cuesBuf) {
-    const seenOffsets = new Set<number>();
-    let cp = 0;
-    while (cp < cuesBuf.length) {
-      const ci = readEbmlId(cuesBuf, cp, cuesBuf.length);
-      if (!ci) break;
-      const csz = readEbmlSize(cuesBuf, ci.nextPos, cuesBuf.length);
-      if (!csz || csz.size < 0) break;
-      const eStart = csz.nextPos;
-      const eEnd = Math.min(cuesBuf.length, eStart + csz.size);
-      if (ci.id === 0xbb) {
-        let cueTimeTicks = -1;
-        let clusterRelPos = -1;
-        let fp = eStart;
-        while (fp < eEnd) {
-          const fi = readEbmlId(cuesBuf, fp, eEnd);
-          if (!fi) break;
-          const fs = readEbmlSize(cuesBuf, fi.nextPos, eEnd);
-          if (!fs || fs.size < 0) break;
-          const vs = fs.nextPos;
-          const ve = Math.min(eEnd, vs + fs.size);
-          if (fi.id === 0xb3) {
-            cueTimeTicks = readEbmlUint(cuesBuf, vs, ve - vs);
-          } else if (fi.id === 0xb7) {
-            let pp = vs;
-            while (pp < ve) {
-              const pi = readEbmlId(cuesBuf, pp, ve);
-              if (!pi) break;
-              const psz = readEbmlSize(cuesBuf, pi.nextPos, ve);
-              if (!psz || psz.size < 0) break;
-              const pvs = psz.nextPos;
-              const pve = Math.min(ve, pvs + psz.size);
-              if (pi.id === 0xf1 && clusterRelPos === -1) {
-                clusterRelPos = readEbmlUint(cuesBuf, pvs, pve - pvs);
-              }
-              pp = pve;
-            }
-          }
-          fp = ve;
-        }
-        if (cueTimeTicks >= 0 && clusterRelPos >= 0) {
-          const absOff = segmentDataStart + clusterRelPos;
-          if (!seenOffsets.has(absOff)) {
-            seenOffsets.add(absOff);
-            clusterRefs.push({ timeSec: cueTimeTicks * tickToSec, absOffset: absOff });
-          }
-        }
-      }
-      cp = eEnd;
-    }
-    clusterRefs.sort((a, b) => a.timeSec - b.timeSec);
-  }
-
-  const readClusterHeader = async (absOffset: number): Promise<{ dataStart: number; endOffset: number; timeSec: number } | null> => {
-    if (absOffset + 8 >= segmentEnd) return null;
-    const probe = await reader.read(absOffset, Math.min(64, segmentEnd - absOffset));
-    const cid = readEbmlId(probe, 0, probe.length);
-    if (!cid || cid.id !== 0x1f43b675) return null;
-    const csz = readEbmlSize(probe, cid.nextPos, probe.length);
-    if (!csz) return null;
-    const dataStart = absOffset + csz.nextPos;
-    const endOffset = csz.size >= 0 ? Math.min(segmentEnd, dataStart + csz.size) : segmentEnd;
-
-    let timeSec = 0;
-    const ti = readEbmlId(probe, csz.nextPos, probe.length);
-    if (ti && ti.id === 0xe7) {
-      const tsz = readEbmlSize(probe, ti.nextPos, probe.length);
-      if (tsz && tsz.size >= 0 && tsz.nextPos + tsz.size <= probe.length) {
-        timeSec = readEbmlUint(probe, tsz.nextPos, tsz.size) * tickToSec;
-      }
-    }
-    return { dataStart, endOffset, timeSec };
-  };
-
-  // Discover first cluster if SeekHead/initial scan didn't reach it
-  if (firstClusterAbsOffset === null) {
-    let scanPos = segmentDataStart;
-    let guard = 0;
-    while (scanPos + 12 < segmentEnd && guard < 256) {
-      guard++;
-      const p = await reader.read(scanPos, Math.min(32, segmentEnd - scanPos));
-      const eid = readEbmlId(p, 0, p.length);
-      if (!eid) break;
-      const esz = readEbmlSize(p, eid.nextPos, p.length);
-      if (!esz) break;
-      if (eid.id === 0x1f43b675) {
-        firstClusterAbsOffset = scanPos;
-        break;
-      }
-      if (esz.size < 0) break;
-      scanPos += esz.nextPos + esz.size;
-    }
-  }
-
-  const findClusterStartOffset = async (targetTimeSec: number): Promise<number | null> => {
-    if (clusterRefs.length > 0) {
-      let best = clusterRefs[0].absOffset;
-      for (let i = 0; i < clusterRefs.length; i++) {
-        if (clusterRefs[i].timeSec <= targetTimeSec) {
-          best = clusterRefs[i].absOffset;
-        } else {
-          break;
-        }
-      }
-      return best;
-    }
-    if (firstClusterAbsOffset === null) return null;
-
-    // Fallback when Cues are absent: fast-walk Cluster headers without reading video payloads
-    let cur = firstClusterAbsOffset;
-    let best = firstClusterAbsOffset;
-    let guard = 0;
-    while (cur < segmentEnd && guard < 10000) {
-      guard++;
-      const hdr = await readClusterHeader(cur);
-      if (!hdr || hdr.endOffset <= cur) break;
-      if (hdr.timeSec <= targetTimeSec) {
-        best = cur;
-        cur = hdr.endOffset;
-      } else {
-        break;
-      }
-    }
-    return best;
-  };
 
   return {
     mime,

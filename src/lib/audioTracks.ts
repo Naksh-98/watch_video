@@ -34,6 +34,28 @@ export interface AudioTrackOption {
   mseSupported?: boolean;
 }
 
+export interface SubtitleTrackOption {
+  index: number;
+  id: string;
+  label: string;
+  language: string;
+  languageCode: string;
+  kind: string;
+  codec?: string;
+  codecRaw?: string;
+  isDefault: boolean;
+  forced: boolean;
+  containerType?: 'mp4' | 'mkv';
+  containerTrackNumber?: number;
+  textSupported: boolean;
+}
+
+export interface MediaTracksInspectionResult {
+  audioTracks: AudioTrackOption[];
+  subtitleTracks: SubtitleTrackOption[];
+  containerType?: 'mp4' | 'mkv';
+}
+
 const ISO_639_MAP: Record<string, string> = {
   en: 'English',
   eng: 'English',
@@ -133,6 +155,11 @@ const GENERIC_HANDLER_NAMES = new Set([
   'core media audio',
   'gpac iso audio handler',
   'iso media file produced by google inc.',
+  'subtitlehandler',
+  'subtitle',
+  'subtitles',
+  'timed text media handler',
+  'tx3g',
   'handler',
   'audio',
 ]);
@@ -163,11 +190,13 @@ export function formatAudioLanguage(code?: string): string {
   return baseCode.toUpperCase();
 }
 
-export function buildAudioTrackLabel(
+function buildMediaTrackLabel(
   index: number,
+  fallbackPrefix: string,
   rawLabel?: string,
   languageCode?: string,
-  codec?: string
+  codec?: string,
+  forced?: boolean
 ): string {
   const cleanLabel = (rawLabel || '').trim();
   const langName = formatAudioLanguage(languageCode);
@@ -186,7 +215,11 @@ export function buildAudioTrackLabel(
   } else if (langName) {
     display = langName;
   } else {
-    display = `Audio Track ${index + 1}`;
+    display = `${fallbackPrefix} ${index + 1}`;
+  }
+
+  if (forced && display.toLowerCase().indexOf('forced') === -1) {
+    display = `${display} [Forced]`;
   }
 
   if (codec) {
@@ -194,6 +227,71 @@ export function buildAudioTrackLabel(
   }
 
   return display;
+}
+
+export function buildAudioTrackLabel(
+  index: number,
+  rawLabel?: string,
+  languageCode?: string,
+  codec?: string
+): string {
+  return buildMediaTrackLabel(index, 'Audio Track', rawLabel, languageCode, codec);
+}
+
+export function buildSubtitleTrackLabel(
+  index: number,
+  rawLabel?: string,
+  languageCode?: string,
+  codec?: string,
+  forced?: boolean
+): string {
+  return buildMediaTrackLabel(index, 'Subtitle Track', rawLabel, languageCode, codec, forced);
+}
+
+export function extractNativeTextTracks(
+  video: HTMLVideoElement | null,
+  ignoreExternalTrack?: TextTrack | null
+): {
+  tracks: SubtitleTrackOption[];
+  nativeTrackRefs: TextTrack[];
+  activeIndex: number;
+} {
+  if (!video || !video.textTracks) {
+    return { tracks: [], nativeTrackRefs: [], activeIndex: -1 };
+  }
+
+  const list = video.textTracks;
+  const tracks: SubtitleTrackOption[] = [];
+  const nativeTrackRefs: TextTrack[] = [];
+  let activeIndex = -1;
+
+  for (let i = 0; i < list.length; i++) {
+    const t = list[i];
+    if (!t || (ignoreExternalTrack && t === ignoreExternalTrack)) continue;
+    const kind = (t.kind || '').trim().toLowerCase();
+    if (kind === 'chapters' || kind === 'metadata') continue;
+
+    const idx = tracks.length;
+    const langCode = (t.language || '').trim().toLowerCase();
+    const isShowing = t.mode === 'showing';
+    if (isShowing && activeIndex === -1) {
+      activeIndex = idx;
+    }
+    tracks.push({
+      index: idx,
+      id: t.id || `native-sub-${idx}`,
+      label: buildSubtitleTrackLabel(idx, t.label, langCode),
+      language: formatAudioLanguage(langCode),
+      languageCode: langCode,
+      kind: kind || 'subtitles',
+      isDefault: isShowing,
+      forced: kind === 'forced',
+      textSupported: true,
+    });
+    nativeTrackRefs.push(t);
+  }
+
+  return { tracks, nativeTrackRefs, activeIndex };
 }
 
 export function extractNativeAudioTracks(video: HTMLVideoElement | null): {
@@ -334,6 +432,52 @@ function formatMp4Codec(fourcc: string): string {
   }
 }
 
+function formatMp4SubtitleCodec(fourcc: string): { codec: string; textSupported: boolean } {
+  const clean = fourcc.trim();
+  switch (clean) {
+    case 'tx3g':
+      return { codec: 'Timed Text', textSupported: true };
+    case 'wvtt':
+      return { codec: 'WebVTT', textSupported: true };
+    case 'text':
+      return { codec: 'Text', textSupported: true };
+    case 'mp4s':
+    case 'subp':
+      return { codec: 'VobSub Bitmap', textSupported: false };
+    case 'c608':
+      return { codec: 'CEA-608', textSupported: false };
+    default:
+      return { codec: clean, textSupported: false };
+  }
+}
+
+function formatMkvSubtitleCodec(codecId: string): { codec: string; textSupported: boolean } {
+  const clean = codecId.trim();
+  switch (clean) {
+    case 'S_TEXT/UTF8':
+      return { codec: 'SRT', textSupported: true };
+    case 'S_TEXT/ASS':
+      return { codec: 'ASS', textSupported: true };
+    case 'S_TEXT/SSA':
+      return { codec: 'SSA', textSupported: true };
+    case 'S_TEXT/WEBVTT':
+      return { codec: 'WebVTT', textSupported: true };
+    case 'S_HDMV/PGS':
+      return { codec: 'PGS Bitmap', textSupported: false };
+    case 'S_VOBSUB':
+      return { codec: 'VobSub Bitmap', textSupported: false };
+    case 'S_DVBSUB':
+      return { codec: 'DVB Bitmap', textSupported: false };
+    case 'S_HDMV/TEXTST':
+      return { codec: 'TextST', textSupported: false };
+    default:
+      return {
+        codec: clean.replace(/^S_/, '').replace(/\/.*$/, '') || 'Subtitle',
+        textSupported: clean.indexOf('S_TEXT/') === 0,
+      };
+  }
+}
+
 function formatMkvCodec(codecId: string): string {
   const clean = codecId.trim();
   if (!clean) return '';
@@ -342,7 +486,8 @@ function formatMkvCodec(codecId: string): string {
   return clean.replace(/^A_/, '').replace(/\/.*$/, '');
 }
 
-async function parseMp4AudioTracks(reader: ByteReader): Promise<AudioTrackOption[]> {
+async function parseMp4MediaTracks(reader: ByteReader): Promise<MediaTracksInspectionResult> {
+  const empty: MediaTracksInspectionResult = { audioTracks: [], subtitleTracks: [], containerType: 'mp4' };
   const totalSize = reader.size;
   let offset = 0;
   let iterations = 0;
@@ -376,16 +521,16 @@ async function parseMp4AudioTracks(reader: ByteReader): Promise<AudioTrackOption
       const payloadSize = boxSize - headerSize;
       // Guard against corrupted or absurdly large moov boxes (> 32 MB)
       if (payloadSize <= 0 || payloadSize > 32 * 1024 * 1024) {
-        return [];
+        return empty;
       }
       const moovBytes = await reader.read(offset + headerSize, payloadSize);
-      return extractMp4TracksFromMoov(moovBytes);
+      return extractMp4MediaTracksFromMoov(moovBytes);
     }
 
     offset += boxSize;
   }
 
-  return [];
+  return empty;
 }
 
 export function iterateMp4Children(
@@ -418,24 +563,50 @@ export function iterateMp4Children(
   }
 }
 
-function extractMp4TracksFromMoov(bytes: Uint8Array): AudioTrackOption[] {
+function extractMp4MediaTracksFromMoov(bytes: Uint8Array): MediaTracksInspectionResult {
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  const tracks: AudioTrackOption[] = [];
+  const audioTracks: AudioTrackOption[] = [];
+  const subtitleTracks: SubtitleTrackOption[] = [];
+  const chapterTrackIds = new Set<number>();
+
+  interface ParsedMp4Trak {
+    trackId: number;
+    handlerType: string;
+    handlerName: string;
+    customName: string;
+    langCode: string;
+    fourccRaw: string;
+    isEnabled: boolean;
+  }
+  const parsedTraks: ParsedMp4Trak[] = [];
 
   iterateMp4Children(bytes, 0, bytes.length, (type, trakStart, trakEnd) => {
     if (type !== 'trak') return;
 
+    let trackId = 0;
     let handlerType = '';
     let handlerName = '';
     let customName = '';
     let langCode = '';
-    let codec = '';
     let fourccRaw = '';
     let isEnabled = true;
 
     iterateMp4Children(bytes, trakStart, trakEnd, (tType, pStart, pEnd) => {
       if (tType === 'tkhd' && pStart + 4 <= pEnd) {
         isEnabled = (bytes[pStart + 3] & 1) === 1;
+        const version = bytes[pStart];
+        const idOff = version === 1 ? pStart + 20 : pStart + 12;
+        if (idOff + 4 <= pEnd) {
+          trackId = view.getUint32(idOff, false);
+        }
+      } else if (tType === 'tref') {
+        iterateMp4Children(bytes, pStart, pEnd, (rType, rStart, rEnd) => {
+          if (rType === 'chap') {
+            for (let off = rStart; off + 4 <= rEnd; off += 4) {
+              chapterTrackIds.add(view.getUint32(off, false));
+            }
+          }
+        });
       } else if (tType === 'udta') {
         iterateMp4Children(bytes, pStart, pEnd, (uType, uStart, uEnd) => {
           if (uType === 'name' && uEnd > uStart) {
@@ -475,7 +646,6 @@ function extractMp4TracksFromMoov(bytes: Uint8Array): AudioTrackOption[] {
               iterateMp4Children(bytes, minfStart, minfEnd, (stblType, stblStart, stblEnd) => {
                 if (stblType === 'stsd' && stblStart + 16 <= stblEnd) {
                   fourccRaw = readAscii(bytes, stblStart + 12, 4);
-                  codec = formatMp4Codec(fourccRaw);
                 }
               });
             });
@@ -484,27 +654,64 @@ function extractMp4TracksFromMoov(bytes: Uint8Array): AudioTrackOption[] {
       }
     });
 
-    if (handlerType === 'soun') {
-      const idx = tracks.length;
-      const rawLabel = customName || handlerName;
-      const mseMime = getMp4MseMime(fourccRaw);
-      tracks.push({
+    parsedTraks.push({
+      trackId,
+      handlerType,
+      handlerName,
+      customName,
+      langCode,
+      fourccRaw,
+      isEnabled,
+    });
+  });
+
+  for (let i = 0; i < parsedTraks.length; i++) {
+    const tr = parsedTraks[i];
+    const rawLabel = tr.customName || tr.handlerName;
+
+    if (tr.handlerType === 'soun') {
+      const idx = audioTracks.length;
+      const codec = formatMp4Codec(tr.fourccRaw);
+      const mseMime = getMp4MseMime(tr.fourccRaw);
+      audioTracks.push({
         index: idx,
         id: String(idx),
-        label: buildAudioTrackLabel(idx, rawLabel, langCode, codec),
-        language: formatAudioLanguage(langCode),
-        languageCode: langCode,
+        label: buildAudioTrackLabel(idx, rawLabel, tr.langCode, codec),
+        language: formatAudioLanguage(tr.langCode),
+        languageCode: tr.langCode,
         kind: '',
         codec,
-        enabled: isEnabled && !tracks.some((t) => t.enabled),
+        enabled: tr.isEnabled && !audioTracks.some((t) => t.enabled),
         containerType: 'mp4',
+        containerTrackNumber: tr.trackId || undefined,
         mseMime,
         mseSupported: checkMseMimeSupported(mseMime),
       });
+    } else if (
+      (tr.handlerType === 'sbtl' || tr.handlerType === 'text' || tr.handlerType === 'subp') &&
+      !chapterTrackIds.has(tr.trackId)
+    ) {
+      const idx = subtitleTracks.length;
+      const subInfo = formatMp4SubtitleCodec(tr.fourccRaw || tr.handlerType);
+      subtitleTracks.push({
+        index: idx,
+        id: `mp4-sub-${idx}`,
+        label: buildSubtitleTrackLabel(idx, rawLabel, tr.langCode, subInfo.codec),
+        language: formatAudioLanguage(tr.langCode),
+        languageCode: tr.langCode,
+        kind: 'subtitles',
+        codec: subInfo.codec,
+        codecRaw: tr.fourccRaw.trim() || tr.handlerType,
+        isDefault: tr.isEnabled && !subtitleTracks.some((t) => t.isDefault),
+        forced: false,
+        containerType: 'mp4',
+        containerTrackNumber: tr.trackId || undefined,
+        textSupported: subInfo.textSupported,
+      });
     }
-  });
+  }
 
-  return tracks;
+  return { audioTracks, subtitleTracks, containerType: 'mp4' };
 }
 
 export function readEbmlId(bytes: Uint8Array, pos: number, end: number): { id: number; nextPos: number } | null {
@@ -561,8 +768,13 @@ export function readEbmlUint(bytes: Uint8Array, start: number, len: number): num
   return val;
 }
 
-function extractMkvTracksFromBuffer(bytes: Uint8Array, start: number, end: number): AudioTrackOption[] {
-  const tracks: AudioTrackOption[] = [];
+function extractMkvMediaTracksFromBuffer(
+  bytes: Uint8Array,
+  start: number,
+  end: number
+): MediaTracksInspectionResult {
+  const audioTracks: AudioTrackOption[] = [];
+  const subtitleTracks: SubtitleTrackOption[] = [];
   let pos = start;
 
   while (pos < end) {
@@ -583,6 +795,7 @@ function extractMkvTracksFromBuffer(bytes: Uint8Array, start: number, end: numbe
       let languageIetf = '';
       let codecId = '';
       let flagDefault = 1;
+      let flagForced = 0;
       let flagEnabled = 1;
 
       let tPos = entryStart;
@@ -603,17 +816,18 @@ function extractMkvTracksFromBuffer(bytes: Uint8Array, start: number, end: numbe
         else if (fId.id === 0x22b59d) languageIetf = readUtf8(bytes, valStart, valLen);
         else if (fId.id === 0x86) codecId = readUtf8(bytes, valStart, valLen);
         else if (fId.id === 0x88) flagDefault = readEbmlUint(bytes, valStart, valLen);
+        else if (fId.id === 0x55aa) flagForced = readEbmlUint(bytes, valStart, valLen);
         else if (fId.id === 0xb9) flagEnabled = readEbmlUint(bytes, valStart, valLen);
 
         tPos = valEnd;
       }
 
+      const langCode = (languageIetf || language).trim().toLowerCase();
       if (trackType === 2) {
-        const idx = tracks.length;
-        const langCode = (languageIetf || language).trim().toLowerCase();
+        const idx = audioTracks.length;
         const codec = formatMkvCodec(codecId);
         const mseMime = getMkvMseMime(codecId);
-        tracks.push({
+        audioTracks.push({
           index: idx,
           id: String(idx),
           label: buildAudioTrackLabel(idx, name, langCode, codec),
@@ -621,11 +835,30 @@ function extractMkvTracksFromBuffer(bytes: Uint8Array, start: number, end: numbe
           languageCode: langCode,
           kind: '',
           codec,
-          enabled: flagEnabled !== 0 && flagDefault !== 0 && !tracks.some((t) => t.enabled),
+          enabled: flagEnabled !== 0 && flagDefault !== 0 && !audioTracks.some((t) => t.enabled),
           containerType: 'mkv',
           containerTrackNumber: trackNumber,
           mseMime,
           mseSupported: checkMseMimeSupported(mseMime),
+        });
+      } else if (trackType === 17) {
+        const idx = subtitleTracks.length;
+        const subInfo = formatMkvSubtitleCodec(codecId);
+        const forced = flagForced !== 0;
+        subtitleTracks.push({
+          index: idx,
+          id: `mkv-sub-${idx}`,
+          label: buildSubtitleTrackLabel(idx, name, langCode, subInfo.codec, forced),
+          language: formatAudioLanguage(langCode),
+          languageCode: langCode,
+          kind: forced ? 'forced' : 'subtitles',
+          codec: subInfo.codec,
+          codecRaw: codecId.trim(),
+          isDefault: flagEnabled !== 0 && flagDefault !== 0 && !subtitleTracks.some((t) => t.isDefault),
+          forced,
+          containerType: 'mkv',
+          containerTrackNumber: trackNumber,
+          textSupported: subInfo.textSupported,
         });
       }
     }
@@ -633,7 +866,7 @@ function extractMkvTracksFromBuffer(bytes: Uint8Array, start: number, end: numbe
     pos = entryEnd;
   }
 
-  return tracks;
+  return { audioTracks, subtitleTracks, containerType: 'mkv' };
 }
 
 function findTracksSeekOffset(bytes: Uint8Array, start: number, end: number): number | null {
@@ -678,24 +911,25 @@ function findTracksSeekOffset(bytes: Uint8Array, start: number, end: number): nu
   return null;
 }
 
-async function parseMkvAudioTracks(reader: ByteReader): Promise<AudioTrackOption[]> {
+async function parseMkvMediaTracks(reader: ByteReader): Promise<MediaTracksInspectionResult> {
+  const empty: MediaTracksInspectionResult = { audioTracks: [], subtitleTracks: [], containerType: 'mkv' };
   const initialLen = Math.min(reader.size, 2 * 1024 * 1024);
   const bytes = await reader.read(0, initialLen);
-  if (bytes.length < 16) return [];
+  if (bytes.length < 16) return empty;
 
   let pos = 0;
   // Skip EBML header (0x1A45DFA3)
   const ebmlId = readEbmlId(bytes, pos, bytes.length);
-  if (!ebmlId || ebmlId.id !== 0x1a45dfa3) return [];
+  if (!ebmlId || ebmlId.id !== 0x1a45dfa3) return empty;
   const ebmlSize = readEbmlSize(bytes, ebmlId.nextPos, bytes.length);
-  if (!ebmlSize || ebmlSize.size < 0) return [];
+  if (!ebmlSize || ebmlSize.size < 0) return empty;
   pos = ebmlSize.nextPos + ebmlSize.size;
 
   // Enter Segment (0x18538067)
   const segId = readEbmlId(bytes, pos, bytes.length);
-  if (!segId || segId.id !== 0x18538067) return [];
+  if (!segId || segId.id !== 0x18538067) return empty;
   const segSize = readEbmlSize(bytes, segId.nextPos, bytes.length);
-  if (!segSize) return [];
+  if (!segSize) return empty;
 
   const segmentDataStart = segSize.nextPos;
   const segmentScanEnd =
@@ -726,13 +960,13 @@ async function parseMkvAudioTracks(reader: ByteReader): Promise<AudioTrackOption
     if (childId.id === 0x1654ae6b) {
       // Found Tracks element
       if (childEnd <= bytes.length) {
-        return extractMkvTracksFromBuffer(bytes, childStart, childEnd);
+        return extractMkvMediaTracksFromBuffer(bytes, childStart, childEnd);
       }
       if (childSize.size <= 4 * 1024 * 1024 && childEnd <= reader.size) {
         const tracksBytes = await reader.read(childStart, childSize.size);
-        return extractMkvTracksFromBuffer(tracksBytes, 0, tracksBytes.length);
+        return extractMkvMediaTracksFromBuffer(tracksBytes, 0, tracksBytes.length);
       }
-      return [];
+      return empty;
     }
 
     if (childId.id === 0x114d9b74 && childEnd <= bytes.length && tracksSeekOffset === null) {
@@ -753,27 +987,28 @@ async function parseMkvAudioTracks(reader: ByteReader): Promise<AudioTrackOption
         const tSize = readEbmlSize(targetBytes, tId.nextPos, targetBytes.length);
         if (tSize && tSize.size > 0 && tSize.size <= 4 * 1024 * 1024) {
           if (tSize.nextPos + tSize.size <= targetBytes.length) {
-            return extractMkvTracksFromBuffer(
+            return extractMkvMediaTracksFromBuffer(
               targetBytes,
               tSize.nextPos,
               tSize.nextPos + tSize.size
             );
           }
           const fullTracks = await reader.read(absPos + tSize.nextPos, tSize.size);
-          return extractMkvTracksFromBuffer(fullTracks, 0, fullTracks.length);
+          return extractMkvMediaTracksFromBuffer(fullTracks, 0, fullTracks.length);
         }
       }
     }
   }
 
-  return [];
+  return empty;
 }
 
-async function inspectWithReader(reader: ByteReader): Promise<AudioTrackOption[]> {
+async function inspectMediaTracksWithReader(reader: ByteReader): Promise<MediaTracksInspectionResult> {
+  const empty: MediaTracksInspectionResult = { audioTracks: [], subtitleTracks: [] };
   try {
-    if (reader.size < 16) return [];
+    if (reader.size < 16) return empty;
     const probe = await reader.read(0, Math.min(16, reader.size));
-    if (probe.length < 12) return [];
+    if (probe.length < 12) return empty;
 
     // EBML / MKV / WebM magic: 1A 45 DF A3
     if (
@@ -782,7 +1017,7 @@ async function inspectWithReader(reader: ByteReader): Promise<AudioTrackOption[]
       probe[2] === 0xdf &&
       probe[3] === 0xa3
     ) {
-      return await parseMkvAudioTracks(reader);
+      return await parseMkvMediaTracks(reader);
     }
 
     // ISO BMFF / MP4 / MOV: box type at bytes 4..8
@@ -796,12 +1031,12 @@ async function inspectWithReader(reader: ByteReader): Promise<AudioTrackOption[]
       boxType === 'wide' ||
       boxType === 'pnot'
     ) {
-      return await parseMp4AudioTracks(reader);
+      return await parseMp4MediaTracks(reader);
     }
   } catch {
-    return [];
+    return empty;
   }
-  return [];
+  return empty;
 }
 
 export function createFileByteReader(file: File): ByteReader {
@@ -848,12 +1083,20 @@ export async function createRangeByteReader(url: string): Promise<ByteReader | n
   }
 }
 
+export async function inspectLocalVideoMediaTracks(file: File): Promise<MediaTracksInspectionResult> {
+  return inspectMediaTracksWithReader(createFileByteReader(file));
+}
+
+export async function inspectStreamMediaTracks(url: string): Promise<MediaTracksInspectionResult> {
+  const reader = await createRangeByteReader(url);
+  if (!reader) return { audioTracks: [], subtitleTracks: [] };
+  return inspectMediaTracksWithReader(reader);
+}
+
 export async function inspectLocalVideoAudioTracks(file: File): Promise<AudioTrackOption[]> {
-  return inspectWithReader(createFileByteReader(file));
+  return (await inspectLocalVideoMediaTracks(file)).audioTracks;
 }
 
 export async function inspectStreamAudioTracks(url: string): Promise<AudioTrackOption[]> {
-  const reader = await createRangeByteReader(url);
-  if (!reader) return [];
-  return inspectWithReader(reader);
+  return (await inspectStreamMediaTracks(url)).audioTracks;
 }
